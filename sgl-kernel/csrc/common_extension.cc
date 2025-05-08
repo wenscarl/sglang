@@ -101,6 +101,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fp8_scaled_mm", torch::kCUDA, &fp8_scaled_mm);
 
   m.def(
+      "fp8_grouped_mm(Tensor output, Tensor a, Tensor b, Tensor "
+      "stride_a, Tensor stride_b, Tensor stride_c, Tensor problem_sizes, Tensor "
+      "expert_offsets) -> ()");
+  m.impl("fp8_grouped_mm", torch::kCUDA, &fp8_grouped_mm);
+
+  m.def(
       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype) -> "
       "Tensor");
   m.impl("fp8_blockwise_scaled_mm", torch::kCUDA, &fp8_blockwise_scaled_mm);
