@@ -281,6 +281,11 @@ class ServerArgs:
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    enable_flashinfer_cutlass_moe: bool = False
+    enable_flashinfer_cutedsl_moe: bool = False
+    enable_flashinfer_trtllm_moe: bool = False
+    enable_triton_kernel_moe: bool = False
+    enable_flashinfer_mxfp4_moe: bool = False
 
     def __post_init__(self):
         # Check deprecated arguments
@@ -296,6 +301,31 @@ class ServerArgs:
             self.moe_a2a_backend = "deepep"
             print_deprecated_warning(
                 "NOTE: --enable-deepep-moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead."
+            )
+        if self.enable_triton_kernel_moe:
+            self.moe_runner_backend = "triton_kernel"
+            print_deprecated_warning(
+                "NOTE: --enable-triton-kernel-moe is deprecated. Please set `--moe-runner-backend` to 'triton_kernel' instead."
+            )
+        if self.enable_flashinfer_cutlass_moe:
+            self.moe_runner_backend = "flashinfer_cutlass"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-cutlass-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutlass' instead."
+            )
+        if self.enable_flashinfer_cutedsl_moe:
+            self.moe_runner_backend = "flashinfer_cutedsl"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-cutedsl-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutedsl' instead."
+            )
+        if self.enable_flashinfer_trtllm_moe:
+            self.moe_runner_backend = "flashinfer_trtllm"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-trtllm-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead."
+            )
+        if self.enable_flashinfer_mxfp4_moe:
+            self.moe_runner_backend = "flashinfer_mxfp4"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead."
             )
 
         # Set missing default values
@@ -1957,6 +1987,31 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="(Deprecated) Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-cutlass-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-cutedsl-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer CuteDSL MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-trtllm-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP",
+        )
+        parser.add_argument(
+            "--enable-triton-kernel-moe",
+            action="store_true",
+            help="(Deprecated) Use triton moe grouped gemm kernel.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-mxfp4-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
         )
 
     @classmethod
