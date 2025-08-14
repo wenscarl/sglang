@@ -259,3 +259,91 @@ def cutlass_fp4_group_mm(
         params["blockscale_offsets"],
     )
     return c.to(dtype=out_dtype)
+
+
+def flashinfer_cutedsl_moe_masked(hidden_states: torch.Tensor, #3d, bf16
+                                  input_global_scale: torch.Tensor, # (l,)
+                                  w1: torch.Tensor, #fp4 [l, 2 * n, k // 2] in uint8
+                                  w1_blockscale: torch.Tensor, #e4m3, [l, 2*n ,k // 16]
+                                  w1_alpha, # (l,)
+                                  w2: torch.Tensor, #fp4 [l, k, n // 2] in uint8
+                                  a2_global_scale: torch.Tensor, # (l,)
+                                  w2_blockscale: torch.Tensor, #e4m3, [l, k, n // 16]
+                                  w2_alpha, # (l,)
+                                  masked_m: torch.Tensor,
+                                  topk_idx: torch.Tensor, # (bs, topk)
+                                  routing_weights: torch.Tensor, # (bs, topk)
+):
+    from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
+    from .elementwise import silu_and_mul
+    from .gemm import scaled_fp4_grouped_quant
+
+    n = w1.shape[-2] // 2 # intermediate dimension
+    num_experts, m, k = hidden_states.shape
+    assert max(masked_m) == m
+    
+    aq, aq_sf = scaled_fp4_grouped_quant(
+      hidden_states,
+      input_global_scale,
+    )
+    gateup_output = torch.zeros((num_experts, m, n * 2), dtype=hidden_states.dtype, device=aq.device)
+    gateup_output = gateup_output.permute(1, 2, 0) # requirement of kernel
+    sf_vec_size = 16
+    ab_dtype = "float4_e2m1fn"
+    sf_dtype = "float8_e4m3fn"
+    c_dtype = "bfloat16"
+    # Gemm1
+
+    grouped_gemm_nt_masked(
+        (aq, aq_sf),
+        (w1.permute(1,2,0), w1_blockscale),
+        gateup_output,
+        masked_m.to(aq.device),
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        sf_vec_size=sf_vec_size,
+    ) # in logical [m, n, l]
+    # TODO(shuw): alpha can be fused into gemm kernel pending https://github.com/flashinfer-ai/flashinfer/pull/1498
+    gateup_output *= w1_alpha.view(1, 1, num_experts)
+    
+    # SILU
+    gateup_output = gateup_output.permute(2,0,1).view(-1, 2*n)
+    down_input_shape = (*gateup_output.shape[:-1], gateup_output.shape[-1]//2)
+    down_input = torch.empty(*down_input_shape, dtype=gateup_output.dtype, device=gateup_output.device)
+    silu_and_mul(gateup_output, down_input)
+    
+    down_input = down_input.view(num_experts, m, n) # [l, m, n * 2]
+
+    # Quantize intermediate
+    diq, diq_sf = scaled_fp4_grouped_quant(
+      down_input,
+      a2_global_scale,
+    )
+
+    # Gemm2
+    out = torch.zeros_like(hidden_states)
+    out = out.permute(1, 2, 0) # requirement of kernel
+    grouped_gemm_nt_masked(
+        (diq, diq_sf),
+        (w2.permute(1,2,0), w2_blockscale),
+        out,
+        masked_m.to(diq.device),
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        sf_vec_size=sf_vec_size,
+    ) # in logical [m, k, l]
+    out *= w2_alpha.view(1, 1, num_experts)
+    out = out.permute(2,0,1)
+
+    positions = torch.nonzero(masked_m[topk_idx], as_tuple=False)
+    rows, cols = positions[:,0], positions[:,1]
+    experts = topk_idx[rows, cols]
+    for i in range(num_experts):
+        mask = (experts == i)
+        if mask.any():
+            idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            r, c = rows[idx], cols[idx]
+            out[i, :len(r), :] *= routing_weights[r, c].unsqueeze(-1)
+    return out
