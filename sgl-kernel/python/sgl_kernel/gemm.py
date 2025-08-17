@@ -418,53 +418,6 @@ def scaled_fp4_experts_quant(
     return output, output_scales
 
 
-def flashinfer_cutedsl_grouped_gemm_nt_masked(
-    hidden_states: torch.Tensor,  # 3d
-    input_global_scale: torch.Tensor,  # (l,)
-    weights: torch.Tensor,
-    w_global_scale: torch.Tensor,  # (l,)
-    masked_m: torch.Tensor,
-):
-    from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
-
-    # hidden_states: [l, m, k]
-    # weights: [l, n, k]
-    aq, aq_sf = scaled_fp4_grouped_quant(
-        hidden_states,
-        input_global_scale,
-    )
-    bq, bq_sf = scaled_fp4_grouped_quant(
-        weights,
-        w_global_scale,
-    )
-    num_experts, n, k = weights.shape
-
-    out = torch.zeros(
-        (num_experts, max(masked_m), n), dtype=weights.dtype, device=aq.device
-    )
-    out = out.permute(1, 2, 0)  # requirement of kernel
-    sf_vec_size = 16
-    ab_dtype = "float4_e2m1fn"
-    sf_dtype = "float8_e4m3fn"
-    c_dtype = "bfloat16"
-    grouped_gemm_nt_masked(
-        (aq, aq_sf),
-        (bq, bq_sf),
-        out,
-        masked_m.to(aq.device),
-        ab_dtype=ab_dtype,
-        sf_dtype=sf_dtype,
-        c_dtype=c_dtype,
-        sf_vec_size=sf_vec_size,
-    )
-    alpha = 1.0 / (input_global_scale * w_global_scale).to(out.dtype).view(
-        1, 1, num_experts
-    )
-    out *= alpha
-
-    return out
-
-
 # GPTQ kernels
 def gptq_marlin_gemm(
     a: torch.Tensor,

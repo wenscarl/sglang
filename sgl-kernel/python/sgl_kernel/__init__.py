@@ -42,7 +42,6 @@ from sgl_kernel.gemm import (
     cutlass_scaled_fp4_mm,
     dsv3_fused_a_gemm,
     dsv3_router_gemm,
-    flashinfer_cutedsl_grouped_gemm_nt_masked,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
     gptq_gemm,
