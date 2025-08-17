@@ -810,7 +810,6 @@ class FusedMoE(torch.nn.Module):
                 )
             elif TopKOutputChecker.format_is_triton_kernel(topk_output):
                 raise NotImplementedError()
-
         # Matrix multiply.
         with use_symmetric_memory(get_tp_group()) as sm:
 
