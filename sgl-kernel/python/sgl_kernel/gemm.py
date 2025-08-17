@@ -1,6 +1,7 @@
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
+from sgl_kernel.scalar_type import ScalarType
 from sgl_kernel.utils import _get_cache_buf, get_cuda_stream
 
 
@@ -287,6 +288,7 @@ def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
     torch.ops.sgl_kernel.shuffle_rows.default(input_tensor, dst2src_map, output_tensor)
     return output_tensor
 
+
 def scaled_fp4_grouped_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -416,26 +418,31 @@ def scaled_fp4_experts_quant(
     return output, output_scales
 
 
-def flashinfer_cutedsl_grouped_gemm_nt_masked(hidden_states: torch.Tensor, #3d
-                                              input_global_scale: torch.Tensor, # (l,)
-                                              weights: torch.Tensor,
-                                              w_global_scale: torch.Tensor, # (l,)
-                                              masked_m: torch.Tensor):
+def flashinfer_cutedsl_grouped_gemm_nt_masked(
+    hidden_states: torch.Tensor,  # 3d
+    input_global_scale: torch.Tensor,  # (l,)
+    weights: torch.Tensor,
+    w_global_scale: torch.Tensor,  # (l,)
+    masked_m: torch.Tensor,
+):
     from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
+
     # hidden_states: [l, m, k]
-    # weights: [l, n, k]                                    
+    # weights: [l, n, k]
     aq, aq_sf = scaled_fp4_grouped_quant(
-      hidden_states,
-      input_global_scale,
+        hidden_states,
+        input_global_scale,
     )
     bq, bq_sf = scaled_fp4_grouped_quant(
-      weights,
-      w_global_scale,
-    )    
+        weights,
+        w_global_scale,
+    )
     num_experts, n, k = weights.shape
 
-    out = torch.zeros((num_experts, max(masked_m), n), dtype=weights.dtype, device=aq.device)
-    out = out.permute(1, 2, 0) # requirement of kernel
+    out = torch.zeros(
+        (num_experts, max(masked_m), n), dtype=weights.dtype, device=aq.device
+    )
+    out = out.permute(1, 2, 0)  # requirement of kernel
     sf_vec_size = 16
     ab_dtype = "float4_e2m1fn"
     sf_dtype = "float8_e4m3fn"
@@ -450,7 +457,68 @@ def flashinfer_cutedsl_grouped_gemm_nt_masked(hidden_states: torch.Tensor, #3d
         c_dtype=c_dtype,
         sf_vec_size=sf_vec_size,
     )
-    alpha = 1.0 / (input_global_scale * w_global_scale).to(out.dtype).view(1, 1, num_experts)
+    alpha = 1.0 / (input_global_scale * w_global_scale).to(out.dtype).view(
+        1, 1, num_experts
+    )
     out *= alpha
 
     return out
+
+
+# GPTQ kernels
+def gptq_marlin_gemm(
+    a: torch.Tensor,
+    c: Optional[torch.Tensor],
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    global_scale: Optional[torch.Tensor],
+    b_zeros: Optional[torch.Tensor],
+    g_idx: Optional[torch.Tensor],
+    perm: Optional[torch.Tensor],
+    workspace: torch.Tensor,
+    b_q_type: ScalarType,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    is_k_full: bool = True,
+    use_atomic_add: bool = False,
+    use_fp32_reduce: bool = False,
+    is_zp_float: bool = False,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.gptq_marlin_gemm(
+        a,
+        c,
+        b_q_weight,
+        b_scales,
+        global_scale,
+        b_zeros,
+        g_idx,
+        perm,
+        workspace,
+        b_q_type.id,
+        size_m,
+        size_n,
+        size_k,
+        is_k_full,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
+    )
+
+
+def gptq_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_gptq_qzeros: torch.Tensor,
+    b_gptq_scales: torch.Tensor,
+    b_g_idx: torch.Tensor,
+    use_shuffle: bool,
+    bit: int,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.gptq_gemm(
+        a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit
+    )
+
+
+def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
+    torch.torch.ops.sgl_kernel.gptq_shuffle(q_weight, q_perm, bit)
