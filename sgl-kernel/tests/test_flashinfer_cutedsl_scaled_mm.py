@@ -340,8 +340,6 @@ def test_moe_masked(
         w2_blockscale,
         w2_alpha,
         masked_m,
-        topk_idx,
-        routing_weights.to(hidden_states.device),
     )
 
     # reference

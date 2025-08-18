@@ -272,8 +272,6 @@ def flashinfer_cutedsl_moe_masked(
     w2_blockscale: torch.Tensor,
     w2_alpha,
     masked_m: torch.Tensor,
-    topk_idx: torch.Tensor,
-    routing_weights: torch.Tensor,
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -290,8 +288,6 @@ def flashinfer_cutedsl_moe_masked(
         w2_blockscale (torch.Tensor): blockscale factors, e4m3,
         w2_alpha (torch.Tensor): (l,)
         masked_m (torch.Tensor): Masked dimension indices
-        topk_idx (torch.Tensor): [bs, topk], expert indices selected per token
-        routing_weights (torch.Tensor): [bs, topk], routing probabilities
 
     Notes:
         - Assumes max(masked_m) == m.
