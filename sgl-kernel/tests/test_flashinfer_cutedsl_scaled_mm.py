@@ -160,6 +160,20 @@ def flashinfer_cutedsl_grouped_gemm_nt_masked(
     ab_dtype = "float4_e2m1fn"
     sf_dtype = "float8_e4m3fn"
     c_dtype = "bfloat16"
+    alpha = 1.0 / (input_global_scale * w_global_scale).to(out.dtype).view(
+        1, 1, num_experts
+    )
+
+    def get_cute_dtype(input: torch.Tensor) -> str:
+        if input.dtype == torch.bfloat16:
+            return "bfloat16"
+        elif input.dtype == torch.float16:
+            return "float16"
+        elif input.dtype == torch.float32:
+            return "float32"
+        else:
+            raise ValueError(f"Unsupported cute dtype {input.dtype}")
+
     grouped_gemm_nt_masked(
         (aq, aq_sf),
         (bq, bq_sf),
@@ -169,11 +183,9 @@ def flashinfer_cutedsl_grouped_gemm_nt_masked(
         sf_dtype=sf_dtype,
         c_dtype=c_dtype,
         sf_vec_size=sf_vec_size,
+        alpha=alpha,
+        alpha_dtype=get_cute_dtype(alpha),
     )
-    alpha = 1.0 / (input_global_scale * w_global_scale).to(out.dtype).view(
-        1, 1, num_experts
-    )
-    out *= alpha
 
     return out
 

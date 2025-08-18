@@ -362,14 +362,18 @@ def flashinfer_cutedsl_moe_masked(
     assert aq.dtype == torch.uint8
     ab_dtype = "float4_e2m1fn"
     sf_dtype = "float8_e4m3fn"
-    if hidden_states.dtype == torch.bfloat16:
-        c_dtype = "bfloat16"
-    elif hidden_states.dtype == torch.float16:
-        c_dtype = "float16"
-    elif hidden_states.dtype == torch.float32:
-        c_dtype = "float32"
-    else:
-        raise ValueError(f"Unsupported dtype {hidden_states.dtype} for hidden_states")
+
+    def get_cute_dtype(input: torch.Tensor) -> str:
+        if input.dtype == torch.bfloat16:
+            return "bfloat16"
+        elif input.dtype == torch.float16:
+            return "float16"
+        elif input.dtype == torch.float32:
+            return "float32"
+        else:
+            raise ValueError(f"Unsupported cute dtype {input.dtype}")
+
+    c_dtype = get_cute_dtype(hidden_states)
 
     # Gemm1
 
@@ -382,9 +386,9 @@ def flashinfer_cutedsl_moe_masked(
         sf_dtype=sf_dtype,
         c_dtype=c_dtype,
         sf_vec_size=sf_vec_size,
+        alpha=w1_alpha.view(1, 1, num_experts),
+        alpha_dtype=get_cute_dtype(w1_alpha),
     )  # in logical [m, n, l]
-    # TODO(shuw): alpha can be fused into gemm kernel pending https://github.com/flashinfer-ai/flashinfer/pull/1498
-    gateup_output *= w1_alpha.view(1, 1, num_experts)
 
     # SILU
     gateup_output = gateup_output.permute(2, 0, 1).view(-1, 2 * n)
@@ -416,6 +420,7 @@ def flashinfer_cutedsl_moe_masked(
         sf_dtype=sf_dtype,
         c_dtype=c_dtype,
         sf_vec_size=sf_vec_size,
+        alpha=w2_alpha.view(1, 1, num_experts),
+        alpha_dtype=get_cute_dtype(w2_alpha),
     )  # in logical [m, k, l]
-    out *= w2_alpha.view(1, 1, num_experts)
     return out.permute(2, 0, 1)
