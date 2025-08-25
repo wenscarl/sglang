@@ -13,6 +13,7 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
     should_use_flashinfer_trtllm_moe,
 )
+from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -1280,7 +1281,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             not moe_runner_config.apply_router_weight_on_input
         ), "apply_router_weight_on_input is not supported for Flashinfer"
 
-        from sgl_kernel import flashinfer_cutedsl_moe_masked, scaled_fp4_grouped_quant
 
         out = flashinfer_cutedsl_moe_masked(
             hidden_states=x,
