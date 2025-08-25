@@ -1,7 +1,9 @@
 import pytest
 import torch
 from flashinfer import fp4_quantize
-from sgl_kernel import flashinfer_cutedsl_moe_masked, scaled_fp4_grouped_quant
+from sgl_kernel import scaled_fp4_grouped_quant
+from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
+
 from torch.nn import functional as F
 
 skip_condition = torch.cuda.get_device_capability() < (10, 0)
@@ -339,7 +341,7 @@ def test_moe_masked(
         a2_global_scale,
         w2_blockscale,
         w2_alpha,
-        masked_m,
+        masked_m.to(hidden_states.device),
     )
 
     # reference
