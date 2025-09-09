@@ -28,6 +28,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -1851,6 +1852,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
             accum_output, accum_lse = tmp_output, tmp_lse
 
+        if self.layer_id == 15:
+            dumper.dump("accum_output", accum_output, layer_id=self.layer_id)
         return accum_output
 
     def forward_normal_chunked_kv_prepare(
@@ -2421,6 +2424,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        dumper.on_forward_pass_start()
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
         )
