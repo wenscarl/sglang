@@ -28,7 +28,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
-from sglang.srt.debug_utils.dumper import dumper
+from sglang.srt.debug_utils.dumper import _get_rank, dumper
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -1852,8 +1852,12 @@ class DeepseekV2AttentionMLA(nn.Module):
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
             accum_output, accum_lse = tmp_output, tmp_lse
 
-        if self.layer_id == 15:
-            dumper.dump("accum_output", accum_output, layer_id=self.layer_id)
+        if self.layer_id == 15 and _get_rank() == 0:
+            dumper.dump(
+                "accum_output",
+                accum_output.detach().clone().requires_grad_(False),
+                layer_id=self.layer_id,
+            )
         return accum_output
 
     def forward_normal_chunked_kv_prepare(
