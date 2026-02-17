@@ -1,5 +1,14 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+"""
+FP8 W8A8 compressed-tensors scheme (per-tensor or per-channel weights, static or dynamic activations).
+
+This is the primary scheme for the ModelOpt->CompressedTensors bridge:
+- ModelOpt recipe FP8_PER_CHANNEL_PER_TOKEN_CFG maps to this class with strategy=channel
+  and is_static_input_scheme=False (dynamic per-token activations).
+- strategy: "tensor" -> per-tensor weight scales; "channel" -> per-channel (output dimension).
+- is_static_input_scheme: True -> static activation scales; False -> dynamic per-token (typical for bridge).
+"""
 
 from typing import Callable, Optional
 
@@ -105,6 +114,15 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 output_dim=0,
                 weight_loader=weight_loader,
             )
+            quant_method = getattr(layer, "quant_method", None)
+            quant_config = getattr(
+                quant_method, "quantization_config", None
+            ) or getattr(quant_method, "quant_config", None)
+            setattr(
+                weight_scale,
+                "_allow_1d_scale_reshape",
+                getattr(quant_config, "_modelopt_bridge", False),
+            )
             weight_scale[:] = torch.finfo(torch.float32).min
         elif self.strategy == QuantizationStrategy.TENSOR:
             weight_scale = PerTensorScaleParameter(
@@ -174,6 +192,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             else:
                 weight_scale = layer.weight_scale.data
 
+            # Same shape as compressed_tensors: (out, 1), contiguous. Kernel (fp8_scaled_mm) requires float32.
+            weight_scale = weight_scale.contiguous().view(-1, 1)
+            if weight_scale.dtype != torch.float32:
+                weight_scale = weight_scale.to(torch.float32)
+
             if _use_aiter:
                 # keep the weight as (N, K)
                 layer.weight = Parameter(
@@ -205,6 +228,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
         else:
             layer.input_scale = None
+
 
     def apply_weights(
         self,

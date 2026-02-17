@@ -1422,19 +1422,26 @@ def apply_fp8_linear(
                     )
 
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
+        # Ensure scale_b is float32 and (N, 1) for kernels (ModelOpt CT bridge may differ)
+        n_out = weight.shape[1]
+        scale_b = weight_scale.contiguous().view(-1, 1)
+        if scale_b.shape[0] != n_out:
+            scale_b = scale_b[:n_out].contiguous()
+        scale_b = scale_b.to(torch.float32)
+
         cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
         if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
             # Massage the input to be 2D
             qinput = qinput.view(-1, qinput.shape[-1])
             output = triton_scaled_mm(
-                qinput, weight, x_scale, weight_scale, input.dtype, bias
+                qinput, weight, x_scale, scale_b, input.dtype, bias
             )
         else:
             output = fp8_scaled_mm(
                 qinput,
                 weight,
                 x_scale,
-                weight_scale,
+                scale_b,
                 out_dtype=input.dtype,
                 bias=bias,
             )

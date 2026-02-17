@@ -30,6 +30,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
+    ChannelQuantScaleParameter,
     PackedColumnParameter,
     PackedvLLMParameter,
     PerTensorScaleParameter,
@@ -1465,11 +1466,65 @@ class RowParallelLinear(LinearBase):
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
+            param_name = None
+            for pname, p in self.named_parameters():
+                if p is param:
+                    param_name = pname
+                    break
+            # logger.info(
+            #     "RowParallelLinear scalar loaded_weight reshape: param=%s param.shape=%s",
+            #     param_name or id(param),
+            #     tuple(param.data.shape),
+            # )
             loaded_weight = loaded_weight.reshape(1)
 
+        # Per-channel scale (e.g. CT bridge / ModelOpt FP8 per-channel): checkpoint
+        # may have (out_features,) or (out_features, 1); param is (out_partition, 1).
+        # ModelOpt: 1D (out,) float32; llm_compressor: 2D (out, 1) bfloat16 — only reshape when bridge.
+        if isinstance(param, ChannelQuantScaleParameter):
+            # Debug: print param name (local name on this layer, or full path if available)
+            param_name = None
+            for pname, p in self.named_parameters():
+                if p is param:
+                    param_name = pname
+                    break
+            full_name = f"{type(self).__module__}.{type(self).__qualname__}"
+            # logger.info(
+            #     "RowParallelLinear ChannelQuantScaleParameter branch: param=%s layer=%s "
+            #     "param.shape=%s loaded.shape=%s _allow_1d_reshape=%s",
+            #     param_name or id(param),
+            #     full_name,
+            #     tuple(param.data.shape),
+            #     tuple(loaded_weight.shape),
+            #     getattr(param, "_allow_1d_scale_reshape", False),
+            # )
+            shard_size = param.data.shape[0]
+            if loaded_weight.shape[0] > shard_size:
+                start = self.tp_rank * shard_size
+                loaded_weight = loaded_weight.narrow(0, start, shard_size)
+            if (
+                getattr(param, "_allow_1d_scale_reshape", False)
+                and len(loaded_weight.shape) == 1
+            ):
+                loaded_weight = loaded_weight.reshape(-1, 1).contiguous()
+            param.load_row_parallel_weight(loaded_weight)
+            return
+
+        param_name = None
+        for pname, p in self.named_parameters():
+            if p is param:
+                param_name = pname
+                break
         if isinstance(param, RowvLLMParameter):
             # This `BasevLLMParameter` is defined in sglang/srt/layers/parameter.py,
             # It supports additional parameters like tp_rank and use_presharded_weights.
+            # logger.info(
+            #     "RowParallelLinear load_row_parallel_weight (RowvLLMParameter): param=%s "
+            #     "param.shape=%s loaded.shape=%s",
+            #     param_name or id(param),
+            #     tuple(param.data.shape),
+            #     tuple(loaded_weight.shape),
+            # )
             param.load_row_parallel_weight(
                 loaded_weight,
                 tp_rank=self.tp_rank,

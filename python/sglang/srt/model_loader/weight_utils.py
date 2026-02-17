@@ -42,10 +42,17 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
+from sglang.srt.layers.quantization.compressed_tensors.modelopt_ct_bridge import (
+    modelopt_config_to_compressed_tensors_config,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt import (
     ModelOptFp4Config,
     ModelOptFp8Config,
+)
+from sglang.srt.layers.quantization.modelopt_scheme import (
+    ModelOptQuantizationScheme,
+    detect_modelopt_quantization_scheme,
 )
 from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
@@ -186,6 +193,16 @@ def get_quant_config(
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+        # ModelOpt scheme-based routing: CT bridge vs native config
+        if model_config.quantization and model_config.quantization.startswith(
+            "modelopt"
+        ):
+            scheme = detect_modelopt_quantization_scheme(hf_quant_config)
+            if scheme == ModelOptQuantizationScheme.FP8_PER_CHANNEL_PER_TOKEN_CFG:
+                return modelopt_config_to_compressed_tensors_config(
+                    hf_quant_config,
+                    packed_modules_mapping=packed_modules_mapping,
+                )
         return quant_cls.from_config(hf_quant_config)
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
@@ -253,6 +270,15 @@ def get_quant_config(
         elif model_config.quantization.startswith("modelopt") and (
             config.get("producer", {}).get("name", "").startswith("modelopt")
         ):
+            # ModelOpt scheme-based routing: CT bridge vs native config
+            scheme = detect_modelopt_quantization_scheme(
+                config, require_modelopt_producer=True
+            )
+            if scheme == ModelOptQuantizationScheme.FP8_PER_CHANNEL_PER_TOKEN_CFG:
+                return modelopt_config_to_compressed_tensors_config(
+                    config,
+                    packed_modules_mapping=config.get("packed_modules_mapping"),
+                )
             quant_algo = config["quantization"]["quant_algo"]
             if quant_algo is None:
                 # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
