@@ -1333,7 +1333,9 @@ class FlashInferFP4MoE(FusedMoE):
             routing_logits=router_logits,
             routing_bias=correction_bias,
             hidden_states=hs_fp4,
-            hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).reshape(*hs_scale_linear.shape[:-1], -1),
+            hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).reshape(
+                *hs_scale_linear.shape[:-1], -1
+            ),
             gemm1_weights=self.gemm1_weights_fp4_shuffled.data,
             gemm1_weights_scale=self.gemm1_scales_fp4_shuffled.data.view(
                 torch.float8_e4m3fn
