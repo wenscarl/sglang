@@ -841,10 +841,6 @@ class ServerArgs:
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
-            logger.warning(
-                "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE is deprecated. "
-                "Please use --enable-prefill-delayer instead."
-            )
             self.enable_prefill_delayer = True
         if x := envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get():
             self.prefill_delayer_max_delay_passes = x
