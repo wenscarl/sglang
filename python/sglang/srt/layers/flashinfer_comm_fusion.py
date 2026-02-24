@@ -423,69 +423,6 @@ def flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
-def flashinfer_allreduce(
-    input: torch.Tensor,
-    group: Optional[ProcessGroup] = None,
-) -> torch.Tensor:
-    """
-    Standalone allreduce operation using FlashInfer's unified API.
-    Automatically selects between IPC and MNNVL backends.
-
-    Args:
-        input: Input tensor to allreduce
-        group: Process group (defaults to TP group)
-
-    Returns:
-        Output tensor after allreduce
-    """
-    if not is_flashinfer_available() or not _unified_allreduce:
-        logger.debug("FlashInfer unified API not available")
-        return None
-
-    world_size = get_tensor_model_parallel_world_size()
-    if world_size <= 1:
-        return input
-
-    if group is None:
-        try:
-            group = get_tp_group().cpu_group
-        except Exception:
-            return None
-
-    # Ensure workspace is initialized
-    if not ensure_workspace_initialized(
-        max_token_num=input.shape[0] if len(input.shape) > 1 else 1,
-        hidden_dim=input.shape[-1],
-        dtype=input.dtype,
-        group=group,
-    ):
-        logger.debug("FlashInfer workspace not available")
-        return None
-
-    if _workspace_manager.workspace is None:
-        logger.debug("FlashInfer workspace is None")
-        return None
-
-    # Use FlashInfer's unified allreduce_fusion API for standalone allreduce
-    output = torch.empty_like(input)
-    try:
-        if _AllReduceFusionPattern is None or _allreduce_fusion is None:
-            return None
-
-        _allreduce_fusion(
-            input=input,
-            workspace=_workspace_manager.workspace,
-            pattern=_AllReduceFusionPattern.kAllReduce,
-            launch_with_pdl=True,
-            output=output,
-        )
-    except Exception as e:
-        logger.warning(f"FlashInfer allreduce failed: {e}")
-        return None
-
-    return output
-
-
 def cleanup_flashinfer_workspace():
     """Clean up FlashInfer workspace"""
     global _workspace_manager
