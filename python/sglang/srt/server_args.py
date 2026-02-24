@@ -832,11 +832,19 @@ class ServerArgs:
 
         # When user passes --enable-flashinfer-allreduce-fusion, enable with auto backend
         if self.enable_flashinfer_allreduce_fusion and self.flashinfer_allreduce_fusion_backend is None:
+            logger.warning(
+                "--enable-flashinfer-allreduce-fusion is deprecated. "
+                "Please use --flashinfer-allreduce-fusion-backend=auto instead."
+            )
             self.flashinfer_allreduce_fusion_backend = "auto"
         self.enable_flashinfer_allreduce_fusion = False
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
+            logger.warning(
+                "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE is deprecated. "
+                "Please use --enable-prefill-delayer instead."
+            )
             self.enable_prefill_delayer = True
         if x := envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get():
             self.prefill_delayer_max_delay_passes = x

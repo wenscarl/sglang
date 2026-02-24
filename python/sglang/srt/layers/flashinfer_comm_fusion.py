@@ -7,7 +7,7 @@ from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.environ import envs
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -123,6 +123,7 @@ class FlashInferWorkspaceManager:
         rank: int,
         max_token_num: int,
         hidden_dim: int,
+        backend: str = "auto",
         group: Optional[ProcessGroup] = None,
         use_fp32_lamport: bool = False,
         dtype: Optional[torch.dtype] = None,
@@ -168,22 +169,10 @@ class FlashInferWorkspaceManager:
         if _mnnvl_comm_backend is not None and group is not None:
             comm_backend = _mnnvl_comm_backend(group)
 
-        # Determine backend from environment variable or use auto
-        backend_choice = envs.SGLANG_FLASHINFER_ALLREDUCE_FUSION_BACKEND.get()
-        if not backend_choice or backend_choice == "":
-            backend_choice = "auto"
-        elif backend_choice not in ["auto", "trtllm", "mnnvl"]:
-            logger.warning(
-                f"Invalid backend choice '{backend_choice}' for SGLANG_FLASHINFER_ALLREDUCE_FUSION_BACKEND. "
-                f"Valid options are: 'auto', 'trtllm', 'mnnvl'. Using 'auto'."
-            )
-            backend_choice = "auto"
-
         try:
             # Use FlashInfer's unified API to create workspace
-            # Backend can be forced via SGLANG_FLASHINFER_ALLREDUCE_FUSION_BACKEND env var
             self.workspace = _create_allreduce_fusion_workspace(
-                backend=backend_choice,
+                backend=backend,
                 world_size=world_size,
                 rank=rank,
                 max_token_num=max_token_num,
@@ -245,11 +234,13 @@ def ensure_workspace_initialized(
         not _workspace_manager.initialized
         or _workspace_manager.world_size != world_size
     ):
+        backend = get_global_server_args().flashinfer_allreduce_fusion_backend or "auto"
         _workspace_manager.initialize(
             world_size=world_size,
             rank=rank,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
+            backend=backend,
             use_fp32_lamport=use_fp32_lamport,
             dtype=dtype,
             group=group,
