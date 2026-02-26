@@ -331,9 +331,59 @@ class BlockQuantScaleParameter(_ColumnvLLMParameter, RowvLLMParameter):
     """
     Parameter class for weight scales loaded for weights with
     block-wise quantization. Uses both column and row parallelism.
+
+    ModelOpt FP8 block checkpoints may use 4D scale tensors (e.g. (32, 1, 112, 1));
+    we squeeze to 2D to match Fp8LinearMethod / CompressedTensors format.
     """
 
-    pass
+    def load_row_parallel_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        tp_rank: int = 0,
+        use_presharded_weights: bool = False,
+    ):
+        if loaded_weight.dim() == 4:
+            loaded_weight = loaded_weight.squeeze().contiguous()
+        super().load_row_parallel_weight(
+            loaded_weight,
+            tp_rank=tp_rank,
+            use_presharded_weights=use_presharded_weights,
+        )
+
+    def load_column_parallel_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        tp_rank: int = 0,
+        use_presharded_weights: bool = False,
+    ):
+        if loaded_weight.dim() == 4:
+            loaded_weight = loaded_weight.squeeze().contiguous()
+        super().load_column_parallel_weight(
+            loaded_weight,
+            tp_rank=tp_rank,
+            use_presharded_weights=use_presharded_weights,
+        )
+
+    def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
+        if loaded_weight.dim() == 4:
+            loaded_weight = loaded_weight.squeeze().contiguous()
+        super().load_merged_column_weight(loaded_weight, **kwargs)
+
+    def load_qkv_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        tp_rank: int = 0,
+        use_presharded_weights: bool = False,
+        **kwargs,
+    ):
+        if loaded_weight.dim() == 4:
+            loaded_weight = loaded_weight.squeeze().contiguous()
+        super().load_qkv_weight(
+            loaded_weight,
+            tp_rank=tp_rank,
+            use_presharded_weights=use_presharded_weights,
+            **kwargs,
+        )
 
 
 class PerTensorScaleParameter(BasevLLMParameter):

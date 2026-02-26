@@ -27,10 +27,11 @@ from sglang.srt.layers.quantization.modelopt_scheme import (
 
 logger = logging.getLogger(__name__)
 
-# Backward compatibility: string constant for FP8 per-channel per-token recipe
+# Backward compatibility: string constants for ModelOpt recipes
 FP8_PER_CHANNEL_PER_TOKEN_CFG = (
     ModelOptQuantizationScheme.FP8_PER_CHANNEL_PER_TOKEN_CFG.value
 )
+FP8_BLOCK_CFG = ModelOptQuantizationScheme.FP8_BLOCK_CFG.value
 
 
 def is_modelopt_fp8_per_channel_per_token_config(config: Dict[str, Any]) -> bool:
@@ -116,6 +117,87 @@ def modelopt_config_to_compressed_tensors_config(
     logger.info(
         "ModelOpt->CT bridge: using CompressedTensorsW8A8Fp8 (channel, dynamic per-token) for %s",
         ModelOptQuantizationScheme.FP8_PER_CHANNEL_PER_TOKEN_CFG.value,
+    )
+    return CompressedTensorsConfig.from_config(ct_config_dict)
+
+
+def _is_fp8_block_config(config: Dict[str, Any]) -> bool:
+    """Return True if config indicates FP8 block (for bridge when scheme detection returns None)."""
+    quant = _get_quant_section(config)
+    quant_cfg = quant.get("quant_cfg") or quant.get("recipe") or ""
+    if isinstance(quant_cfg, str) and "FP8_BLOCK" in quant_cfg.upper():
+        return True
+    if (
+        quant.get("weight_block_size") is not None
+        or quant.get("block_size") is not None
+    ):
+        return True
+    quant_algo = (quant.get("quant_algo") or "").upper()
+    # BLOCK or PB (e.g. fp8_pb_wo = FP8 per-block weight-only)
+    return "FP8" in quant_algo and ("BLOCK" in quant_algo or "PB" in quant_algo)
+
+
+def _get_weight_block_size_from_config(config: Dict[str, Any]) -> List[int]:
+    """Extract weight_block_size from ModelOpt config (quantization section or top-level)."""
+    quant = _get_quant_section(config)
+    block_size = quant.get("weight_block_size") or quant.get("block_size")
+    if block_size is not None:
+        if isinstance(block_size, (list, tuple)) and len(block_size) == 2:
+            return list(block_size)
+        raise ValueError(
+            "ModelOpt FP8 block config must have weight_block_size or block_size "
+            "as a 2-element list, e.g. [128, 128]."
+        )
+    return [128, 128]
+
+
+def modelopt_config_to_compressed_tensors_config_block(
+    config: Dict[str, Any],
+    packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+) -> CompressedTensorsConfig:
+    """
+    Build a CompressedTensorsConfig for ModelOpt FP8 block quantization.
+
+    Linear layers use Fp8LinearMethod (via linear_fp8_config) with block-wise
+    weight scales and dynamic per-token activations. This reuses the same
+    block FP8 kernels as native Fp8Config (weight_block_size).
+
+    :param config: Full ModelOpt config dict (from hf_quant_config.json or config.json).
+    :param packed_modules_mapping: Optional mapping of fused layer names to shard names.
+    :return: CompressedTensorsConfig with linear_fp8_config set for block FP8.
+    """
+    scheme = detect_modelopt_quantization_scheme(config)
+    if scheme != ModelOptQuantizationScheme.FP8_BLOCK_CFG and not _is_fp8_block_config(
+        config
+    ):
+        raise ValueError(
+            "Config is not a ModelOpt FP8 block config. "
+            f"Expected {ModelOptQuantizationScheme.FP8_BLOCK_CFG.value}."
+        )
+
+    quant = _get_quant_section(config)
+    ignore: List[str] = list(quant.get("ignore") or quant.get("exclude_modules") or [])
+    weight_block_size = _get_weight_block_size_from_config(config)
+
+    # CT config with linear_fp8_config so get_quant_method returns Fp8LinearMethod for linear layers
+    ct_config_dict: Dict[str, Any] = {
+        "format": CompressionFormat.float_quantized.value,
+        "ignore": ignore,
+        "config_groups": {},
+        "packed_modules_mapping": packed_modules_mapping or {},
+        "linear_fp8_config": {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": weight_block_size,
+            "ignored_layers": ignore,
+        },
+        "_modelopt_bridge": False,
+    }
+
+    logger.info(
+        "ModelOpt->CT bridge: using FP8 block (linear_fp8_config) weight_block_size=%s for %s",
+        weight_block_size,
+        ModelOptQuantizationScheme.FP8_BLOCK_CFG.value,
     )
     return CompressedTensorsConfig.from_config(ct_config_dict)
 

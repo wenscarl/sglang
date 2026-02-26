@@ -73,6 +73,10 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_SUPPORT_CUTLASS_BLOCK_FP8` | Use Cutlass kernels when running blockwise fp8 GEMM on Hopper or Blackwell GPUs | `false` |
 | `SGLANG_CUTLASS_MOE` (deprecated) | Use Cutlass FP8 MoE kernel on Blackwell GPUs (deprecated, use --moe-runner-backend=cutlass) | `false` |
 
+**FP8 block GEMM backend (e.g. ModelOpt fp8_pb_wo):** The default may use a DeepGEMM path that can give incorrect results. To use CUTLASS or FlashInfer TRTLLM instead, set one of the following before starting the server (priority: FlashInfer first if enabled and on Blackwell, then CUTLASS if enabled):
+
+- **CUTLASS block FP8** (Hopper/Blackwell, CUDA 12+): `export SGLANG_SUPPORT_CUTLASS_BLOCK_FP8=1`
+- **FlashInfer TRTLLM block FP8** (Blackwell only, requires FlashInfer): `export SGLANG_ENABLE_FLASHINFER_FP8_GEMM=1`
 
 ## Distributed Computing
 

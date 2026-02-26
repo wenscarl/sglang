@@ -6,6 +6,8 @@ FP8 W8A8 compressed-tensors scheme (per-tensor or per-channel weights, static or
 This is the primary scheme for the ModelOpt->CompressedTensors bridge:
 - ModelOpt recipe FP8_PER_CHANNEL_PER_TOKEN_CFG maps to this class with strategy=channel
   and is_static_input_scheme=False (dynamic per-token activations).
+- ModelOpt recipe FP8_BLOCK_CFG is handled via the bridge's linear_fp8_config (Fp8LinearMethod
+  with weight_block_size), not via this scheme; see modelopt_config_to_compressed_tensors_config_block.
 - strategy: "tensor" -> per-tensor weight scales; "channel" -> per-channel (output dimension).
 - is_static_input_scheme: True -> static activation scales; False -> dynamic per-token (typical for bridge).
 """

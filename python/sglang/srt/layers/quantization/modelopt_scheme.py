@@ -25,9 +25,10 @@ class ModelOptQuantizationScheme(str, Enum):
     are loaded via CompressedTensorsConfig; others use native ModelOpt configs.
     """
 
-    # FP8: existing native (per-tensor) and CT-bridge (per-channel per-token)
+    # FP8: existing native (per-tensor), CT-bridge (per-channel per-token), and block
     FP8_DEFAULT_CFG = "FP8_DEFAULT_CFG"
     FP8_PER_CHANNEL_PER_TOKEN_CFG = "FP8_PER_CHANNEL_PER_TOKEN_CFG"
+    FP8_BLOCK_CFG = "FP8_BLOCK_CFG"
 
     # INT8 (future CT bridge)
     INT8_DEFAULT_CFG = "INT8_DEFAULT_CFG"
@@ -49,6 +50,7 @@ class ModelOptQuantizationScheme(str, Enum):
         """True if this scheme is served via CompressedTensors (CT) bridge."""
         return self in (
             ModelOptQuantizationScheme.FP8_PER_CHANNEL_PER_TOKEN_CFG,
+            ModelOptQuantizationScheme.FP8_BLOCK_CFG,
             ModelOptQuantizationScheme.INT8_DEFAULT_CFG,
             ModelOptQuantizationScheme.INT8_SMOOTHQUANT_CFG,
             ModelOptQuantizationScheme.INT4_AWQ_CFG,
@@ -60,6 +62,7 @@ class ModelOptQuantizationScheme(str, Enum):
         if self in (
             ModelOptQuantizationScheme.FP8_DEFAULT_CFG,
             ModelOptQuantizationScheme.FP8_PER_CHANNEL_PER_TOKEN_CFG,
+            ModelOptQuantizationScheme.FP8_BLOCK_CFG,
             ModelOptQuantizationScheme.INT8_DEFAULT_CFG,
             ModelOptQuantizationScheme.INT8_SMOOTHQUANT_CFG,
         ):
@@ -138,6 +141,15 @@ def detect_modelopt_quantization_scheme(
     if "FP8" in quant_algo:
         if "PER_CHANNEL" in quant_algo and "PER_TOKEN" in quant_algo:
             return ModelOptQuantizationScheme.FP8_PER_CHANNEL_PER_TOKEN_CFG
+        # BLOCK or PB (e.g. fp8_pb_wo = FP8 per-block weight-only)
+        if "BLOCK" in quant_algo or "PB" in quant_algo:
+            return ModelOptQuantizationScheme.FP8_BLOCK_CFG
+        # FP8 block can also be indicated by weight_block_size in config (no quant_cfg)
+        if (
+            quant.get("weight_block_size") is not None
+            or quant.get("block_size") is not None
+        ):
+            return ModelOptQuantizationScheme.FP8_BLOCK_CFG
         return ModelOptQuantizationScheme.FP8_DEFAULT_CFG
     if "INT4" in quant_algo and "AWQ" in quant_algo:
         return ModelOptQuantizationScheme.INT4_AWQ_CFG

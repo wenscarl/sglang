@@ -596,9 +596,15 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config,
                 )
 
-            self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+            weights_iter = self._get_all_weights(model_config, model)
+            from sglang.srt.model_loader.weight_utils import (
+                is_modelopt_fp8_block_checkpoint,
+                transform_modelopt_block_weights_iterator,
             )
+
+            if is_modelopt_fp8_block_checkpoint(model_config):
+                weights_iter = transform_modelopt_block_weights_iterator(weights_iter)
+            self.load_weights_and_postprocess(model, weights_iter, target_device)
 
         return model.eval()
 
@@ -659,6 +665,13 @@ class LayeredModelLoader(DefaultModelLoader):
 
             # Get all weights from disk
             weights = self._get_all_weights(model_config, model)
+            from sglang.srt.model_loader.weight_utils import (
+                is_modelopt_fp8_block_checkpoint,
+                transform_modelopt_block_weights_iterator,
+            )
+
+            if is_modelopt_fp8_block_checkpoint(model_config):
+                weights = transform_modelopt_block_weights_iterator(weights)
 
             # Helper function to recursively fill the weights of a module
             def fill_module(module, fqn: List[str], weights):

@@ -39,6 +39,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.compressed_tensors.modelopt_ct_bridge import (
     modelopt_config_to_compressed_tensors_config,
+    modelopt_config_to_compressed_tensors_config_block,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -52,6 +53,113 @@ from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warni
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+
+def _hf_quant_config_to_dict(hf_quant_config: Any) -> Dict[str, Any]:
+    """Convert HF quantization_config to a plain dict so .get() and 'in' work in scheme detection."""
+    if isinstance(hf_quant_config, dict):
+        return dict(hf_quant_config)
+    if hasattr(hf_quant_config, "to_dict"):
+        return hf_quant_config.to_dict()
+    if hasattr(hf_quant_config, "__dict__"):
+        return dict(hf_quant_config.__dict__)
+    return dict(hf_quant_config)
+
+
+def _is_fp8_per_channel_per_token_config(config: Dict[str, Any]) -> bool:
+    """Return True if config indicates FP8 per-channel per-token (for bridge fallback when scheme detection misses)."""
+    quant = config.get("quantization") if "quantization" in config else config
+    if not isinstance(quant, dict):
+        return False
+    quant_cfg = quant.get("quant_cfg") or quant.get("recipe") or ""
+    if isinstance(quant_cfg, str) and "FP8_PER_CHANNEL_PER_TOKEN" in quant_cfg.upper():
+        return True
+    quant_algo = (quant.get("quant_algo") or "").upper()
+    return (
+        "FP8" in quant_algo
+        and "PER_CHANNEL" in quant_algo
+        and "PER_TOKEN" in quant_algo
+    )
+
+
+def _is_fp8_block_config(config: Dict[str, Any]) -> bool:
+    """Return True if config indicates FP8 block quantization (for bridge fallback when scheme detection misses)."""
+    quant = config.get("quantization") if "quantization" in config else config
+    if not isinstance(quant, dict):
+        return False
+    quant_cfg = quant.get("quant_cfg") or quant.get("recipe") or ""
+    if isinstance(quant_cfg, str) and "FP8_BLOCK" in quant_cfg.upper():
+        return True
+    if (
+        quant.get("weight_block_size") is not None
+        or quant.get("block_size") is not None
+    ):
+        return True
+    quant_algo = (quant.get("quant_algo") or "").upper()
+    # BLOCK or PB (e.g. fp8_pb_wo = FP8 per-block weight-only)
+    return "FP8" in quant_algo and ("BLOCK" in quant_algo or "PB" in quant_algo)
+
+
+def is_modelopt_fp8_block_checkpoint(model_config: ModelConfig) -> bool:
+    """True if this is a ModelOpt FP8 block checkpoint (fp8_pb_wo, etc.).
+
+    Used to apply weight key/tensor transforms so checkpoint shapes match
+    CompressedTensors/Fp8LinearMethod (weight_scale_inv 2D, no k_scale/v_scale).
+    """
+    if not (model_config.quantization or "").startswith("modelopt"):
+        return False
+    hf_quant = getattr(model_config.hf_config, "quantization_config", None)
+    if hf_quant is None:
+        hf_quant = getattr(model_config.hf_config, "compression_config", None)
+    if hf_quant is None:
+        return False
+    config = _hf_quant_config_to_dict(hf_quant)
+    return _is_fp8_block_config(config)
+
+
+def transform_modelopt_block_weights_iterator(
+    weights_iter: Iterable[Tuple[str, torch.Tensor]],
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Transform ModelOpt FP8 block checkpoint keys/tensors to match Fp8LinearMethod.
+
+    - Remap .weight_scale -> .weight_scale_inv (param name in model).
+    - Squeeze 4D weight_scale (e.g. (32, 1, 112, 1)) to 2D (32, 112).
+    - Skip .k_scale and .v_scale (not used by block path; CT format has no separate KV scales).
+    """
+    for name, tensor in weights_iter:
+        if name.endswith(".k_scale") or name.endswith(".v_scale"):
+            continue
+        if name.endswith(".weight_scale") and ".weight_scale_inv" not in name:
+            name = name[: -len(".weight_scale")] + ".weight_scale_inv"
+            if tensor.dim() == 4:
+                tensor = tensor.squeeze().contiguous().clone()
+        yield name, tensor
+
+
+def _ensure_modelopt_fp8_quant_algo(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure config has quant_algo that ModelOptFp8Config.from_config accepts (contains 'FP8').
+
+    Some ModelOpt configs use quant_cfg/recipe without quant_algo, or quant_algo has a value
+    that doesn't contain 'FP8', which causes ModelOptFp8Config.from_config to raise. When the
+    user passes --quantization modelopt_fp8, we normalize so from_config succeeds.
+    """
+    import copy
+
+    quant_section = config.get("quantization") if "quantization" in config else config
+    if quant_section is None:
+        return config
+    quant_algo = quant_section.get("quant_algo")
+    if quant_algo is not None and "FP8" in str(quant_algo).upper():
+        return config
+    # quant_algo missing or doesn't contain FP8; set to "FP8" so from_config accepts
+    config = copy.deepcopy(config)
+    if "quantization" in config:
+        config["quantization"] = dict(config["quantization"])
+        config["quantization"]["quant_algo"] = "FP8"
+    else:
+        config["quant_algo"] = "FP8"
+    return config
+
 
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
@@ -183,17 +291,35 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
+        # Ensure we have a dict so scheme detection and bridge can use .get() / "in"
+        hf_quant_config = _hf_quant_config_to_dict(hf_quant_config)
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         # ModelOpt scheme-based routing: CT bridge vs native config
         if model_config.quantization and model_config.quantization.startswith(
             "modelopt"
         ):
             scheme = detect_modelopt_quantization_scheme(hf_quant_config)
+            # Direct check: config may have quant_cfg/recipe that scheme detection missed (e.g. key casing)
+            if scheme is None and _is_fp8_per_channel_per_token_config(hf_quant_config):
+                scheme = ModelOptQuantizationScheme.FP8_PER_CHANNEL_PER_TOKEN_CFG
+            if scheme is None and _is_fp8_block_config(hf_quant_config):
+                scheme = ModelOptQuantizationScheme.FP8_BLOCK_CFG
             if scheme == ModelOptQuantizationScheme.FP8_PER_CHANNEL_PER_TOKEN_CFG:
                 return modelopt_config_to_compressed_tensors_config(
                     hf_quant_config,
                     packed_modules_mapping=packed_modules_mapping,
                 )
+            if scheme == ModelOptQuantizationScheme.FP8_BLOCK_CFG:
+                return modelopt_config_to_compressed_tensors_config_block(
+                    hf_quant_config,
+                    packed_modules_mapping=packed_modules_mapping,
+                )
+            if scheme == ModelOptQuantizationScheme.FP8_DEFAULT_CFG:
+                return ModelOptFp8Config.from_config(hf_quant_config)
+            # Fall-through: scheme is None or other. For modelopt_fp8, ensure config
+            # has quant_algo that ModelOptFp8Config.from_config accepts (must contain "FP8").
+            if model_config.quantization == "modelopt_fp8":
+                hf_quant_config = _ensure_modelopt_fp8_quant_algo(hf_quant_config)
         return quant_cls.from_config(hf_quant_config)
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
@@ -262,11 +388,20 @@ def get_quant_config(
             scheme = detect_modelopt_quantization_scheme(
                 config, require_modelopt_producer=True
             )
+            if scheme is None and _is_fp8_block_config(config):
+                scheme = ModelOptQuantizationScheme.FP8_BLOCK_CFG
             if scheme == ModelOptQuantizationScheme.FP8_PER_CHANNEL_PER_TOKEN_CFG:
                 return modelopt_config_to_compressed_tensors_config(
                     config,
                     packed_modules_mapping=config.get("packed_modules_mapping"),
                 )
+            if scheme == ModelOptQuantizationScheme.FP8_BLOCK_CFG:
+                return modelopt_config_to_compressed_tensors_config_block(
+                    config,
+                    packed_modules_mapping=config.get("packed_modules_mapping"),
+                )
+            if scheme == ModelOptQuantizationScheme.FP8_DEFAULT_CFG:
+                return ModelOptFp8Config.from_config(config)
             quant_algo = config["quantization"]["quant_algo"]
             if quant_algo is None:
                 # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
@@ -277,6 +412,7 @@ def get_quant_config(
                     )
                 return None
             elif quant_algo == "FP8" or model_config.quantization == "modelopt_fp8":
+                config = _ensure_modelopt_fp8_quant_algo(config)
                 return ModelOptFp8Config.from_config(config)
             elif "FP4" in quant_algo:
                 return ModelOptFp4Config.from_config(config)
