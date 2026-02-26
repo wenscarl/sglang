@@ -129,6 +129,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_QUANT_ALLOW_DOWNCASTING` | Allow weight dtype downcasting during loading (e.g., fp32 → fp16). By default, SGLang rejects this kind of downcasting when using quantization. | `false` |
 | `SGLANG_FP8_IGNORED_LAYERS` | A comma-separated list of layer names to ignore during FP8 quantization. For example: `model.layers.0,model.layers.1.,qkv_proj`. | `""` |
 
+For **ModelOpt FP8 block** checkpoints (`fp8_pb_wo`, etc.), you may need to steer the block FP8 GEMM backend explicitly (see `SGLANG_SUPPORT_CUTLASS_BLOCK_FP8` / `SGLANG_ENABLE_FLASHINFER_FP8_GEMM` above and prefer `--fp8-gemm-backend` when available).
 
 ## Distributed Computing
 
