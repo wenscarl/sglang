@@ -622,7 +622,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
-                self.forward_prefill_metadata = NoneModul
+                self.forward_prefill_metadata = None
             # Get maximum sequence length.
             if getattr(forward_batch, "seq_lens_cpu", None) is not None:
                 max_seq = forward_batch.seq_lens_cpu.max().item()
