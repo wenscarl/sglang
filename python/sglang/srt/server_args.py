@@ -827,7 +827,10 @@ class ServerArgs:
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
         # When user passes --enable-flashinfer-allreduce-fusion, enable with auto backend
-        if self.enable_flashinfer_allreduce_fusion and self.flashinfer_allreduce_fusion_backend is None:
+        if (
+            self.enable_flashinfer_allreduce_fusion
+            and self.flashinfer_allreduce_fusion_backend is None
+        ):
             logger.warning(
                 "--enable-flashinfer-allreduce-fusion is deprecated. "
                 "Please use --flashinfer-allreduce-fusion-backend=auto instead."
@@ -1676,7 +1679,9 @@ class ServerArgs:
 
         # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
-        # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
+        # With backend "auto": trtllm (single-node only, flashinfer#2006) or mnnvl (multi-node, SM100 only).
+        # So auto-enable only when single-node (any SM90/100) or multi-node + Blackwell (so "auto" can pick mnnvl).
+        # Multi-node + Hopper is excluded: trtllm would be chosen and does not support multi-node.
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
         is_h20_device = (
@@ -1696,6 +1701,7 @@ class ServerArgs:
             and (is_sm90_supported() or is_sm100_supported())
             and not self.enable_dp_attention
             and not is_h20_device
+            and (self.nnodes == 1 or is_sm100_supported())
             and self.moe_a2a_backend == "none"
         ):
             self.flashinfer_allreduce_fusion_backend = "auto"
