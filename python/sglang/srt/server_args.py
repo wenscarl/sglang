@@ -1677,10 +1677,15 @@ class ServerArgs:
                 "Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
-        # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
-        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
-        # With backend "auto": trtllm (single-node only, flashinfer#2006) or mnnvl (multi-node, SM100 only).
-        # So auto-enable only when single-node (any SM90/100) or multi-node + Blackwell (so "auto" can pick mnnvl).
+        # FlashInfer allreduce fusion (fused allreduce + Residual + RMSNorm) backend support:
+        #
+        #   Feature / Framework   | SM100 | SM90 | Single Node | Multi-Node |
+        #   --------------------- | ----- | ---- | ----------- | ---------- |
+        #   TRT-LLM AllReduce     | Yes   | Yes  | Yes         | No         |
+        #   MNNVL AllReduce       | Yes   | No   | Yes         | Yes        |
+        #
+        # With backend "auto": trtllm is used on single-node, mnnvl on both single or multi-node (SM100 only).
+        # Auto-enable only when single-node (any SM90/100) or multi-node + Blackwell (so "auto" can pick mnnvl).
         # Multi-node + Hopper is excluded: trtllm would be chosen and does not support multi-node.
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
@@ -4137,7 +4142,7 @@ class ServerArgs:
             choices=["auto", "trtllm", "mnnvl"],
             default=None,
             help="Enable FlashInfer allreduce fusion and choose backend. When not set, the feature is disabled. "
-            "Options: 'auto' (choose best), 'trtllm', 'mnnvl'. "
+            "Options: 'auto' (choose best), 'trtllm' (SM90/100, single-node only), 'mnnvl' (SM100, single/multi-node). "
             "Fuses allreduce with Residual + RMSNorm for supported MoE models.",
         )
         parser.add_argument(
