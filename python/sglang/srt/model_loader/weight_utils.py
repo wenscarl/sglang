@@ -125,7 +125,7 @@ def is_modelopt_fp8_block_checkpoint(model_config: ModelConfig) -> bool:
     """True if this is a ModelOpt FP8 block checkpoint (fp8_pb_wo, etc.).
 
     Used to apply weight key/tensor transforms so checkpoint shapes match
-    CompressedTensors/Fp8LinearMethod (weight_scale_inv 2D, no k_scale/v_scale).
+    Fp8LinearMethod block FP8 (2D ``weight_scale`` grid, no k_scale/v_scale).
     """
     if not (model_config.quantization or "").startswith("modelopt"):
         return False
@@ -141,17 +141,19 @@ def is_modelopt_fp8_block_checkpoint(model_config: ModelConfig) -> bool:
 def transform_modelopt_block_weights_iterator(
     weights_iter: Iterable[Tuple[str, torch.Tensor]],
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Transform ModelOpt FP8 block checkpoint keys/tensors to match Fp8LinearMethod.
+    """Transform ModelOpt FP8 block checkpoint tensors for Fp8LinearMethod (block FP8).
 
-    - Remap .weight_scale -> .weight_scale_inv (param name in model).
-    - Squeeze 4D weight_scale (e.g. (32, 1, 112, 1)) to 2D (32, 112).
-    - Skip .k_scale and .v_scale (not used by block path; CT format has no separate KV scales).
+    - Keep checkpoint keys as ``*.weight_scale`` (do not rename to ``weight_scale_inv``).
+      ``LlamaForCausalLM.load_weights`` maps ``*.weight_scale_inv`` → ``*.weight_scale``
+      unconditionally (ministral3); Fp8 block linear registers the block grid as
+      ``weight_scale``, so names must remain ``weight_scale`` to load correctly.
+    - Squeeze 4D ``weight_scale`` (e.g. (32, 1, 112, 1)) to 2D (32, 112).
+    - Skip ``.k_scale`` and ``.v_scale`` (not used on this path).
     """
     for name, tensor in weights_iter:
         if name.endswith(".k_scale") or name.endswith(".v_scale"):
             continue
         if name.endswith(".weight_scale") and ".weight_scale_inv" not in name:
-            name = name[: -len(".weight_scale")] + ".weight_scale_inv"
             if tensor.dim() == 4:
                 tensor = tensor.squeeze().contiguous().clone()
         yield name, tensor
