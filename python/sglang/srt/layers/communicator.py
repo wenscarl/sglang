@@ -21,11 +21,9 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.distributed import (
-    attention_tensor_model_parallel_all_reduce,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
-    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -102,11 +100,8 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
-        and get_global_server_args().enable_flashinfer_allreduce_fusion
+        and get_global_server_args().flashinfer_allreduce_fusion_backend is not None
         and not is_flashinfer_allreduce_unavailable()
-        # FlashInfer's TRT-LLM allreduce backend creates its own NCCL communicator
-        # which doesn't support PyTorch sub-process groups used by context parallelism
-        and get_global_server_args().attn_cp_size <= 1
     )
 
 
@@ -460,11 +455,11 @@ class LayerCommunicator:
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual, use_attn_tp_group=True
+                            hidden_states, residual
                         )
                     )
                 else:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
@@ -878,14 +873,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual, use_attn_tp_group=True
+                    hidden_states, residual
                 )
                 handled = True
 
             if not handled:
-                hidden_states = attention_tensor_model_parallel_all_reduce(
-                    hidden_states
-                )
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)

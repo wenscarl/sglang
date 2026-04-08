@@ -92,14 +92,11 @@ def _forward_with_allreduce_fusion(
     residual: Optional[torch.Tensor],
     post_residual_addition: Optional[torch.Tensor],
     weight: torch.Tensor,
-    use_attn_tp_group: bool = True,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
-            get_attn_tensor_model_parallel_world_size,
-            get_moe_expert_parallel_world_size,
-            get_moe_tensor_parallel_world_size,
+            get_tensor_model_parallel_world_size,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
@@ -107,13 +104,7 @@ def _forward_with_allreduce_fusion(
             flashinfer_allreduce_residual_rmsnorm,
         )
 
-        if use_attn_tp_group:
-            world_size = get_attn_tensor_model_parallel_world_size()
-        else:
-            if get_moe_expert_parallel_world_size() > 1:
-                world_size = get_moe_expert_parallel_world_size()
-            else:
-                world_size = get_moe_tensor_parallel_world_size()
+        world_size = get_tensor_model_parallel_world_size()
 
         if world_size > 1:
             if post_residual_addition is not None:
@@ -132,7 +123,6 @@ def _forward_with_allreduce_fusion(
                     residual=residual,
                     weight=weight,
                     eps=norm_module.variance_epsilon,
-                    use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result[0] is not None:
                     return fused_result
@@ -361,11 +351,10 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
-        use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion, prioritizing flashinfer fused operations."""
         return _forward_with_allreduce_fusion(
-            self, x, residual, post_residual_addition, self.weight, use_attn_tp_group
+            self, x, residual, post_residual_addition, self.weight
         )
 
 
@@ -586,7 +575,6 @@ class GemmaRMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
-        use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
         # TODO(brayden): we can see if TRTLLM allreduce fusion can provide gemma-style norm
@@ -596,7 +584,6 @@ class GemmaRMSNorm(MultiPlatformOp):
             residual,
             post_residual_addition,
             self.weight + 1.0,
-            use_attn_tp_group=True,
         )
 
 
