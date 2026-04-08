@@ -92,10 +92,24 @@ FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
+    # mnnvl has a known issue with CUDA graph capture: the workspace uses an internal
+    # barrier counter that is incremented by every allreduce kernel launch, including
+    # the real launches that happen during graph capture. After capture completes, the
+    # counter is at a value proportional to (num_captured_batch_sizes × num_layers).
+    # If ranks advance their counters by different amounts (e.g., due to non-deterministic
+    # capture ordering with large --max-running-requests), subsequent allreduces see
+    # mismatched counters and hang waiting for signals that never arrive.
+    # Fix: skip the fused allreduce during CUDA graph capture. The workspace counter
+    # is then untouched during capture. NCCL allreduce is captured in the graph for
+    # decode replay, while prefill (eager mode) continues to use the fused allreduce.
+    # Ref: https://github.com/vllm-project/vllm/issues/35772
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
     return (
+        not get_is_capture_mode()
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
         # Ref: https://github.com/sgl-project/sglang/issues/17237
-        (_is_sm90_supported or _is_sm100_supported)
+        and (_is_sm90_supported or _is_sm100_supported)
         and _is_flashinfer_available
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE

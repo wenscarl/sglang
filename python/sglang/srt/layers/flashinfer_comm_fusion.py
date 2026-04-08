@@ -117,6 +117,17 @@ if is_flashinfer_available():
 #
 # auto: selects trtllm for single-node (SM90/SM100), mnnvl for multi-node (SM100).
 # mnnvl can also be used explicitly on single-node (SM100).
+#
+# CUDA graph note: the mnnvl backend has a known interaction with CUDA graph
+# capture (vllm-project/vllm#35772). The mnnvl workspace maintains an internal
+# barrier counter that is incremented by every allreduce kernel launch, including
+# the real launches performed during CUDA graph capture. After capture the counter
+# is at an offset proportional to (num_captured_batch_sizes × num_layers), causing
+# subsequent eager (prefill) allreduces to hang because not all ranks advance their
+# counters by the same amount (especially with large --max-running-requests).
+# Fix: apply_flashinfer_allreduce_fusion() skips fusion during CUDA graph capture
+# so the workspace counter is never touched by capture operations. Decode graph
+# replay uses NCCL (captured without mnnvl); prefill (eager) uses mnnvl fusion.
 
 
 def is_flashinfer_allreduce_unavailable() -> bool:
