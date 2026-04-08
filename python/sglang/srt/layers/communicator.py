@@ -99,14 +99,19 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     # If ranks advance their counters by different amounts (e.g., due to non-deterministic
     # capture ordering with large --max-running-requests), subsequent allreduces see
     # mismatched counters and hang waiting for signals that never arrive.
-    # Fix: skip the fused allreduce during CUDA graph capture. The workspace counter
-    # is then untouched during capture. NCCL allreduce is captured in the graph for
-    # decode replay, while prefill (eager mode) continues to use the fused allreduce.
+    # Fix: skip the fused allreduce during CUDA graph capture AND during piecewise
+    # CUDA graph (both capture and replay). Piecewise CUDA graph is used for prefill
+    # where token sizes are large; it is unsafe to mix mnnvl allreduce inside the
+    # piecewise graph context. NCCL is used in these paths instead.
     # Ref: https://github.com/vllm-project/vllm/issues/35772
+    from sglang.srt.compilation.piecewise_context_manager import (
+        is_in_piecewise_cuda_graph,
+    )
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
     return (
         not get_is_capture_mode()
+        and not is_in_piecewise_cuda_graph()
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
         # Ref: https://github.com/sgl-project/sglang/issues/17237
         and (_is_sm90_supported or _is_sm100_supported)

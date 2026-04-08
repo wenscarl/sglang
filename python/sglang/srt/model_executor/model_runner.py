@@ -672,6 +672,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
 
+        # Freeze the FlashInfer allreduce workspace after ALL graph captures
+        # (both regular and piecewise) are complete. Must be last so that
+        # neither CudaGraphRunner nor PiecewiseCudaGraphRunner can corrupt the
+        # workspace by triggering re-initialization during inference.
+        self._freeze_flashinfer_allreduce_workspace()
+
         self.prealloc_symmetric_memory_pool()
 
     def init_routed_experts_capturer(self):
@@ -2057,8 +2063,54 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device != "cuda":
             return
 
+        self._init_flashinfer_allreduce_workspace()
+
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+
+    def _init_flashinfer_allreduce_workspace(self):
+        """
+        Eagerly initialize the FlashInfer allreduce workspace before CUDA graph
+        capture. Without this, workspace initialization (including mnnvl's
+        dist.all_gather_object / broadcast calls) would be triggered lazily on
+        the first decode batch that fits within FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+        which falls inside the CUDA graph capture window.
+
+        Note: autotune's _dummy_run uses batch_size=req_to_token_pool.size which
+        is typically >> FUSE_ALLREDUCE_MAX_BATCH_SIZE (2048), so fusion is never
+        applied during autotune and the workspace is never initialized there.
+        """
+        from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
+        from sglang.srt.layers.flashinfer_comm_fusion import ensure_workspace_initialized
+
+        if self.server_args.flashinfer_allreduce_fusion_backend is None:
+            return
+
+        try:
+            from sglang.srt.distributed import get_tp_group
+
+            group = get_tp_group().cpu_group
+        except Exception:
+            group = None
+
+        ensure_workspace_initialized(
+            max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+            hidden_dim=self.model_config.hidden_size,
+            dtype=self.dtype,
+            group=group,
+        )
+
+    def _freeze_flashinfer_allreduce_workspace(self):
+        """
+        Freeze the FlashInfer allreduce workspace after all CUDA graph captures
+        (regular and piecewise) complete. After this point the workspace object
+        is never destroyed/recreated, protecting GPU pointers baked into captured
+        CUDA graph kernels from becoming stale (which causes mnnvl hangs).
+        """
+        from sglang.srt.layers.flashinfer_comm_fusion import freeze_flashinfer_workspace
+
+        if self.server_args.flashinfer_allreduce_fusion_backend is not None:
+            freeze_flashinfer_workspace()
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""

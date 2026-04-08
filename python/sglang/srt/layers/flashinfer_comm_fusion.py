@@ -152,6 +152,25 @@ class FlashInferWorkspaceManager:
         self._max_token_num_seen: Optional[int] = None
         self._max_hidden_dim_seen: Optional[int] = None
         self._logged_init = False
+        # After all CUDA graph captures complete, prevent workspace from being
+        # destroyed/recreated. CUDA graphs bake workspace GPU pointers into kernel
+        # launches; recreating the workspace invalidates those pointers, causing
+        # mnnvl NVLink signal hangs.
+        self._frozen = False
+
+    def freeze(self):
+        """
+        Freeze the workspace after all CUDA graph captures complete.
+        Once frozen, initialize() becomes a no-op and is_buffer_size_sufficient()
+        always returns True, preventing workspace destruction that would corrupt
+        captured CUDA graph kernel pointers.
+        """
+        if self.initialized:
+            self._frozen = True
+            logger.debug(
+                "FlashInfer workspace frozen (CUDA graph capture complete). "
+                "Workspace will not be re-initialized during inference."
+            )
 
     def initialize(
         self,
@@ -167,6 +186,15 @@ class FlashInferWorkspaceManager:
     ):
         """Initialize workspace using FlashInfer's unified API."""
         global _flashinfer_allreduce_unavailable
+
+        # After all CUDA graph captures, never re-initialize: CUDA graphs bake
+        # workspace GPU pointers into kernel launches. Destroying and recreating
+        # the workspace invalidates those pointers → mnnvl NVLink hangs.
+        if self._frozen:
+            logger.debug(
+                "FlashInfer workspace is frozen; skipping re-initialization."
+            )
+            return
 
         # Track the high-water mark so allocations only grow
         self._max_token_num_seen = max(max_token_num, self._max_token_num_seen or 0)
@@ -258,6 +286,9 @@ class FlashInferWorkspaceManager:
     ) -> bool:
         if not self.initialized or self.workspace is None:
             return False
+        # When frozen, always report sufficient to prevent re-initialization.
+        if self._frozen:
+            return True
         try:
             return self.workspace.is_buffer_size_sufficient(
                 tp_size=self.world_size,
@@ -466,6 +497,17 @@ def flashinfer_allreduce_residual_rmsnorm(
         return None, None
 
     return norm_out, residual_out
+
+
+def freeze_flashinfer_workspace():
+    """
+    Freeze the FlashInfer workspace after all CUDA graph captures complete.
+    Prevents workspace destruction/recreation that would corrupt GPU pointers
+    baked into captured CUDA graph kernels (causes mnnvl NVLink hangs).
+    """
+    global _workspace_manager
+    if _workspace_manager is not None:
+        _workspace_manager.freeze()
 
 
 def cleanup_flashinfer_workspace():
