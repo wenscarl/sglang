@@ -757,6 +757,10 @@ class PiecewiseCudaGraphRunner:
         num_tokens = len(forward_batch.input_ids)
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
+        print(
+            f"[PCG replay] num_tokens={num_tokens} static_num_tokens={static_num_tokens}",
+            flush=True,
+        )
         with enable_piecewise_cuda_graph():
             # Prepare static buffers first so set_forward_context can carry num_tokens
             # into call_begin_forward (via ForwardContext.num_tokens), eliminating the

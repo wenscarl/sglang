@@ -92,6 +92,10 @@ FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
+    # Import here to avoid a circular dependency at module load time.
+    from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
         # Ref: https://github.com/sgl-project/sglang/issues/17237
@@ -102,6 +106,14 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and not is_dp_attention_enabled()
         and get_global_server_args().flashinfer_allreduce_fusion_backend is not None
         and not is_flashinfer_allreduce_unavailable()
+        # Skip during regular CUDA graph capture: the captured graph would bake
+        # in the mnnvl workspace pointer, which becomes stale if the workspace
+        # is ever recreated.  Decode replays fall back to NCCL instead.
+        and not get_is_capture_mode()
+        # Skip during prefill (piecewise CUDA graph): mnnvl workspace pointer
+        # would be baked into a captured graph piece and become stale on recreation.
+        # Prefill falls back to inplace_all_reduce (split op) + separate layernorm.
+        and not is_in_piecewise_cuda_graph()
     )
 
 

@@ -13,6 +13,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -437,6 +438,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         if _AllReduceFusionPattern is None or _allreduce_fusion is None:
             return None, None
 
+#        print(f"trigger_completion_at_end:{trigger_completion_at_end}")
         _allreduce_fusion(
             input=input_tensor,
             workspace=_workspace_manager.workspace,
@@ -455,6 +457,80 @@ def flashinfer_allreduce_residual_rmsnorm(
         return None, None
 
     return norm_out, residual_out
+
+
+def fake_flashinfer_allreduce_residual_rmsnorm_split(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(input_tensor), torch.empty_like(residual)
+
+
+@register_custom_op(
+    mutates_args=["input_tensor", "residual"],
+    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm_split,
+)
+@register_split_op()
+def flashinfer_allreduce_residual_rmsnorm_split(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    In-place split-op for mnnvl fused allreduce + residual + RMSNorm.
+
+    Runs eagerly between piecewise CUDA graph pieces. Writes results back
+    into input_tensor (norm output) and residual (residual output) so that
+    the next CUDA graph piece always reads from the same fixed addresses
+    (piece N's output pool), regardless of which internal path is taken.
+
+    During CUDA graph capture the collective is skipped entirely — only a
+    local residual+rmsnorm is performed — so no NCCL/mnnvl collective is
+    required and the capture never hangs. During replay mnnvl provides the
+    fully-fused allreduce+residual+rmsnorm with correct values.
+    """
+    from sglang.srt.compilation.piecewise_context_manager import get_pcg_capture_stream
+
+    def _local_inplace():
+        """Local residual + rmsnorm, no collective. In-place on inputs."""
+        residual.add_(input_tensor)
+        hidden = residual.float()
+        variance = hidden.pow(2).mean(-1, keepdim=True)
+        input_tensor.copy_(
+            (hidden * torch.rsqrt(variance + eps)).to(residual.dtype) * weight
+        )
+        return input_tensor, residual
+
+    # During CUDA graph capture: skip the collective entirely.
+    # The CUDA graph only records operations; values don't need to be correct.
+    # In-place writes ensure the next piece always reads from the same addresses.
+    if get_pcg_capture_stream() is not None:
+        return _local_inplace()
+
+    # During replay: use mnnvl fused allreduce + residual + rmsnorm.
+    norm_out, residual_out = flashinfer_allreduce_residual_rmsnorm(
+        input_tensor=input_tensor,
+        residual=residual,
+        weight=weight,
+        eps=eps,
+        max_token_num=max_token_num,
+    )
+    if norm_out is not None:
+        # Copy results back into the input tensors to preserve addresses.
+        input_tensor.copy_(norm_out)
+        residual.copy_(residual_out)
+        return input_tensor, residual
+
+    # Fallback: in-place NCCL allreduce + local residual + rmsnorm.
+    from sglang.srt.distributed import tensor_model_parallel_all_reduce
+
+    tensor_model_parallel_all_reduce(input_tensor)
+    return _local_inplace()
 
 
 def cleanup_flashinfer_workspace():
