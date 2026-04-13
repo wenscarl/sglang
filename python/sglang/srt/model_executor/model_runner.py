@@ -2834,23 +2834,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
         if forward_batch.forward_mode.is_decode():
+            torch.cuda.nvtx.range_push("decode")
             ret = self.forward_decode(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            torch.cuda.nvtx.range_pop()
         elif forward_batch.forward_mode.is_split_prefill():
+            torch.cuda.nvtx.range_push("prefill")
             ret = self.forward_split_prefill(
                 forward_batch,
                 reinit_attn_backend=reinit_attn_backend,
                 forward_count=split_forward_count,
             )
+            torch.cuda.nvtx.range_pop()
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            torch.cuda.nvtx.range_push("prefill")
             ret, can_run_graph = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            torch.cuda.nvtx.range_pop()
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:

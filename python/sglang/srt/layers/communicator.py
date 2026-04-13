@@ -94,7 +94,6 @@ FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 def apply_flashinfer_allreduce_fusion(batch_size: int):
     # Import here to avoid a circular dependency at module load time.
     from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
@@ -106,13 +105,9 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and not is_dp_attention_enabled()
         and get_global_server_args().flashinfer_allreduce_fusion_backend is not None
         and not is_flashinfer_allreduce_unavailable()
-        # Skip during regular CUDA graph capture: the captured graph would bake
-        # in the mnnvl workspace pointer, which becomes stale if the workspace
-        # is ever recreated.  Decode replays fall back to NCCL instead.
-        and not get_is_capture_mode()
         # Skip during prefill (piecewise CUDA graph): mnnvl workspace pointer
         # would be baked into a captured graph piece and become stale on recreation.
-        # Prefill falls back to inplace_all_reduce (split op) + separate layernorm.
+        # Decode CUDA graphs still capture the mnnvl kernel inside them.
         and not is_in_piecewise_cuda_graph()
     )
 
@@ -465,16 +460,20 @@ class LayerCommunicator:
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
+                    torch.cuda.nvtx.range_push("allreduce_mnnvl_fused[decode]")
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
                             hidden_states, residual
                         )
                     )
+                    torch.cuda.nvtx.range_pop()
                 else:
+                    torch.cuda.nvtx.range_push("allreduce_nccl[prefill]")
                     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
+                    torch.cuda.nvtx.range_pop()
             else:
                 if residual is None:
                     residual = hidden_states
@@ -884,16 +883,20 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
+                torch.cuda.nvtx.range_push("allreduce_mnnvl_fused[decode]")
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
                 )
+                torch.cuda.nvtx.range_pop()
                 handled = True
 
             if not handled:
+                torch.cuda.nvtx.range_push("allreduce_nccl[prefill]")
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
+                torch.cuda.nvtx.range_pop()
         return hidden_states, residual
 
     @staticmethod
