@@ -224,6 +224,7 @@ def flashinfer_ar_needs_piecewise_cuda_graph_split(server_args) -> bool:
     if fi is None:
         return False
     if fi == "mnnvl":
+        return False
         return True
     if fi == "auto":
         from sglang.srt.utils.common import is_cuda, is_sm100_supported
@@ -841,6 +842,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         return None, None
 
     try:
+        pass
         _allreduce_fusion(
             input=input_tensor,
             workspace=workspace_manager.workspace,
