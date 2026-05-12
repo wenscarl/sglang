@@ -1636,7 +1636,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.w13_blockscale_swizzled = Parameter(
             swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
         )
-        layer.w13_blockscale_swizzled._skip_weight_check = True
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
@@ -1654,7 +1653,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.w2_blockscale_swizzled = Parameter(
             swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
         )
-        layer.w2_blockscale_swizzled._skip_weight_check = True
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
