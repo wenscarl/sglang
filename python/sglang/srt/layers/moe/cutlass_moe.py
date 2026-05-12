@@ -19,11 +19,25 @@ if _is_cuda:
         shuffle_rows,
     )
 
-    from sglang.jit_kernel.activation import silu_and_mul
+    from sglang.jit_kernel.activation import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+    )
     from sglang.jit_kernel.nvfp4 import (
         cutlass_fp4_group_mm,
         scaled_fp4_experts_quant,
     )
+
+    # Map activation name -> SwiGLU-style fused (act(x_gate) * x_up) kernel.
+    # Used by cutlass_moe_fp4 (and cutlass_moe_fp8 below if extended).
+    _ACTIVATION_AND_MUL = {
+        "silu": silu_and_mul,
+        "gelu": gelu_and_mul,
+        "gelu_tanh": gelu_tanh_and_mul,
+        # Gemma's HF-config string for tanh-approx GeLU; alias to gelu_tanh.
+        "gelu_pytorch_tanh": gelu_tanh_and_mul,
+    }
 
 
 def cutlass_fused_experts_fp8(
@@ -359,6 +373,7 @@ def cutlass_moe_fp4(
     topk_ids: torch.Tensor,
     params: CutlassMoEParams,
     apply_router_weight_on_input: bool = False,
+    activation: str = "silu",
 ):
     """
     MoE implementation for FP4 Inputs
@@ -467,11 +482,20 @@ def cutlass_moe_fp4(
     )
     del rep_a_fp4, rep_a_blockscale
 
-    # hidden size dimension is split to one halfpytho sized tensor.
+    # hidden size dimension is split to one half sized tensor.
     intermediate = torch.empty(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )
-    silu_and_mul(c1, intermediate)
+    # Apply gated activation (act(gate) * up).  Defaults to SiLU (matches the
+    # historical hardcoded behavior); models like Gemma that train with GeLU
+    # must pass activation="gelu_tanh" (tanh-approx) or "gelu" (erf-based).
+    act_and_mul = _ACTIVATION_AND_MUL.get(activation)
+    if act_and_mul is None:
+        raise ValueError(
+            f"Unsupported activation {activation!r} for cutlass_moe_fp4. "
+            f"Supported: {sorted(_ACTIVATION_AND_MUL)}"
+        )
+    act_and_mul(c1, intermediate)
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
         intermediate,

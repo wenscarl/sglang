@@ -265,6 +265,7 @@ ACTIVATION_SCHEMES = ["static"]
 ACT_STR_TO_TYPE_MAP = {
     "silu": ActivationType.Swiglu,  # This is the default
     "relu2": ActivationType.Relu2,
+    "gelu": ActivationType.Gelu,
 }
 
 
@@ -1309,7 +1310,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         if input_size_per_partition % 16 != 0:
             raise ValueError(
-                "Unsupported model when in features size is " "not multiple of 16"
+                "Unsupported model when in features size is not multiple of 16"
             )
 
         weight_dtype = (
@@ -1635,6 +1636,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.w13_blockscale_swizzled = Parameter(
             swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
         )
+        layer.w13_blockscale_swizzled._skip_weight_check = True
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
@@ -1652,6 +1654,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.w2_blockscale_swizzled = Parameter(
             swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
         )
+        layer.w2_blockscale_swizzled._skip_weight_check = True
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
@@ -2143,6 +2146,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             topk_ids=topk_ids,
             params=layer.cutlass_moe_params,
             apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+            activation=activation,
         ).to(x.dtype)
         # Scale by routed_scaling_factor is fused into select_experts.
         return StandardCombineInput(hidden_states=output)
