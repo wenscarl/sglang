@@ -2,6 +2,7 @@ import contextlib
 import logging
 import platform
 from typing import Optional, Tuple
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import eager_on_graph
 
 import torch
 import torch.distributed as dist
@@ -742,11 +743,12 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
-@register_custom_op(
-    mutates_args=["input_tensor", "residual", "weight"],
-    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm,
-)
-@register_split_op()
+#@register_custom_op(
+#    mutates_args=["input_tensor", "residual", "weight"],
+#    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm,
+#)
+#@register_split_op()
+@eager_on_graph(enable=True)
 def flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
@@ -842,7 +844,6 @@ def flashinfer_allreduce_residual_rmsnorm(
         return None, None
 
     try:
-        pass
         _allreduce_fusion(
             input=input_tensor,
             workspace=workspace_manager.workspace,
