@@ -1,5 +1,7 @@
+import collections
 import contextlib
 import logging
+import os
 import platform
 from typing import Optional, Tuple
 from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import eager_on_graph
@@ -727,6 +729,78 @@ def ensure_workspace_initialized(
     return workspace_manager.initialized
 
 
+# --- MNNVL FTZ-victim post-mortem dump harness -------------------------------
+#
+# Background: FlashInfer's MNNVL allreduce uses a Lamport buffer with sentinel
+# `-0.0f`. The polling kernel reads the buffer in 4-byte windows interpreted as
+# fp32, and the check `val == 0.F && signbit(val)` is FTZ-vulnerable: any
+# negative subnormal (bit pattern 0x80000001..0x807FFFFF) flushes to -0.0 in the
+# compare unit, gets misread as the sentinel, and the kernel spins forever.
+# (See /mis/mnnvl_debug_summary.md.)
+#
+# This harness snapshots every Nth AR call's inputs to disk. When a hang fires
+# the latest snapshots sit on disk and /mis/analyze_mnnvl_dump.py finds the
+# offending bit patterns. In this branch the AR wrapper has @eager_on_graph,
+# so it runs eagerly between captured graph segments on every replay and a
+# plain D2H copy is safe.
+_MNNVL_HANG_DUMP_STATE = {
+    "call_counter": 0,
+    "warned": False,
+    "files": collections.deque(),
+}
+
+
+def _maybe_dump_mnnvl_hang_inputs(
+    input_tensor: torch.Tensor,
+    use_attn_tp_group: bool,
+) -> None:
+    if not envs.SGLANG_MNNVL_HANG_DUMP.get():
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+
+    state = _MNNVL_HANG_DUMP_STATE
+    call_id = state["call_counter"]
+    state["call_counter"] = call_id + 1
+
+    stride = max(1, envs.SGLANG_MNNVL_HANG_DUMP_STRIDE.get())
+    if call_id % stride != 0:
+        return
+
+    try:
+        dump_dir = envs.SGLANG_MNNVL_HANG_DUMP_DIR.get()
+        os.makedirs(dump_dir, exist_ok=True)
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        payload = {
+            "call_id": call_id,
+            "rank": rank,
+            "use_attn_tp_group": use_attn_tp_group,
+            "input_tensor": input_tensor.detach().cpu(),
+        }
+
+        path = os.path.join(dump_dir, f"mnnvl_hang_rank{rank}_call{call_id}.pt")
+        tmp = path + ".tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+
+        files = state["files"]
+        files.append(path)
+        max_files = max(1, envs.SGLANG_MNNVL_HANG_DUMP_MAX_FILES.get())
+        while len(files) > max_files:
+            old = files.popleft()
+            try:
+                os.unlink(old)
+            except OSError:
+                pass
+    except Exception as e:
+        if not state["warned"]:
+            logger.warning(
+                "MNNVL hang dump failed (silenced thereafter): %s", e
+            )
+            state["warned"] = True
+
+
 def fake_flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
@@ -842,6 +916,8 @@ def flashinfer_allreduce_residual_rmsnorm(
 
     if _allreduce_fusion is None or _AllReduceFusionPattern is None:
         return None, None
+
+    _maybe_dump_mnnvl_hang_inputs(input_tensor, use_attn_tp_group)
 
     try:
         _allreduce_fusion(

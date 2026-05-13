@@ -373,6 +373,16 @@ class Envs:
     # transport issue on GB200/GB300 platforms is fixed and verified resolved.
     SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT = EnvBool(None)
 
+    # MNNVL allreduce-fusion FTZ-victim post-mortem harness. When DUMP=1, every
+    # Nth flashinfer_allreduce_residual_rmsnorm call snapshots its inputs to
+    # disk as mnnvl_hang_rank{R}_call{N}.pt for /mis/analyze_mnnvl_dump.py to
+    # scan (see /mis/mnnvl_debug_summary.md). Only safe when AR runs eagerly
+    # outside CUDA-graph capture (true in this branch via @eager_on_graph).
+    SGLANG_MNNVL_HANG_DUMP = EnvBool(False)
+    SGLANG_MNNVL_HANG_DUMP_DIR = EnvStr("/tmp/mnnvl_hang_dump")
+    SGLANG_MNNVL_HANG_DUMP_STRIDE = EnvInt(4)
+    SGLANG_MNNVL_HANG_DUMP_MAX_FILES = EnvInt(4096)
+
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
