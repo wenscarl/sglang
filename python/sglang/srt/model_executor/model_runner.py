@@ -3012,15 +3012,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             flashinfer_mnnvl_allreduce_fusion_enabled,
         )
 
-        # MNNVL allreduce fusion has a known PCG replay hang (Lamport spin in
-        # the FlashInfer MNNVL path), so skip PCG capture entirely whenever
-        # MNNVL is (potentially) selected.
-        if flashinfer_mnnvl_allreduce_fusion_enabled(self.server_args):
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph because MNNVL allreduce fusion is enabled",
-            )
-            return
+        ## MNNVL allreduce fusion has a known PCG replay hang (Lamport spin in
+        ## the FlashInfer MNNVL path), so skip PCG capture entirely whenever
+        ## MNNVL is (potentially) selected.
+        #if flashinfer_mnnvl_allreduce_fusion_enabled(self.server_args):
+        #    log_info_on_rank0(
+        #        logger,
+        #        "Disable piecewise CUDA graph because MNNVL allreduce fusion is enabled",
+        #    )
+        #    return
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
