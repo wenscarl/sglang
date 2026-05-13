@@ -1,6 +1,8 @@
 import contextlib
 import logging
+import os
 import platform
+import threading
 from typing import Optional, Tuple
 
 import torch
@@ -39,6 +41,12 @@ _create_allreduce_fusion_workspace = None
 _flashinfer_allreduce_unavailable = False
 _posix_transport_override_logged = False
 _mnnvl_non_blackwell_fallback_logged = False
+
+# MNNVL dump state: when SGLANG_MNNVL_HANG_DUMP=1 every 4th (non-capturing)
+# call to flashinfer_allreduce_residual_rmsnorm snapshots its inputs to disk.
+_hang_dump_lock = threading.Lock()
+_hang_dump_call_counter = 0
+_MNNVL_HANG_DUMP_STRIDE = 4  # matches hang_root_cause.md's eager-dump preset
 
 
 def _is_blackwell_system() -> bool:
@@ -755,6 +763,54 @@ def ensure_workspace_initialized(
     return workspace_manager.initialized
 
 
+def _mnnvl_dump_inputs(
+    call_id: int,
+    rank_id: int,
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    use_oneshot: Optional[bool],
+    fp32_acc: bool,
+    use_attn_tp_group: bool,
+) -> None:
+    """Snapshot one flashinfer AR fusion call to disk for offline analysis.
+
+    The hang is on the GPU side (Lamport-buffer polling in FlashInfer's
+    isNegZero<float>; see hang_root_cause.md). The captured tensors can be
+    inspected with analyze_mnnvl_dump.py to identify FTZ subnormal victims
+    that the buggy float-equality polling misreads as the -0.0 sentinel.
+    """
+    dump_dir = envs.SGLANG_MNNVL_HANG_DUMP_DIR.get()
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+    except OSError as e:
+        logger.warning("MNNVL dump: failed to mkdir %s: %s", dump_dir, e)
+        return
+    dump_path = os.path.join(dump_dir, f"mnnvl_hang_rank{rank_id}_call{call_id}.pt")
+    # The CPU copy syncs the stream; this is fine in eager mode. The caller
+    # skips this path entirely during CUDA graph capture (cudaMemcpy is illegal).
+    snapshot = {
+        "input_tensor": input_tensor.detach().to("cpu").clone(),
+        "residual": residual.detach().to("cpu").clone(),
+        "weight": weight.detach().to("cpu").clone(),
+        "input_dtype": str(input_tensor.dtype),
+        "input_shape": tuple(input_tensor.shape),
+        "residual_shape": tuple(residual.shape),
+        "weight_shape": tuple(weight.shape),
+        "eps": float(eps),
+        "use_oneshot": use_oneshot,
+        "fp32_acc": fp32_acc,
+        "use_attn_tp_group": use_attn_tp_group,
+        "rank": rank_id,
+        "call_id": call_id,
+    }
+    try:
+        torch.save(snapshot, dump_path)
+    except Exception as e:
+        logger.error("MNNVL dump failed for rank=%s -> %s: %s", rank_id, dump_path, e)
+
+
 def fake_flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
@@ -851,6 +907,40 @@ def flashinfer_allreduce_residual_rmsnorm(
 
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
+
+    # Dump every 4th call's inputs when requested (stride matches
+    # hang_root_cause.md's eager-dump preset). Skip during CUDA graph capture:
+    # cudaMemcpy is illegal in capture mode. (At graph replay the Python
+    # wrapper is never re-entered, so this path only fires for eager forwards.)
+    global _hang_dump_call_counter
+    if (
+        envs.SGLANG_MNNVL_HANG_DUMP.get()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        with _hang_dump_lock:
+            _hang_dump_call_counter += 1
+            call_id = _hang_dump_call_counter
+        if call_id % _MNNVL_HANG_DUMP_STRIDE == 0:
+            rank_id = (
+                get_attn_tensor_model_parallel_rank()
+                if use_attn_tp_group
+                else (
+                    get_moe_expert_parallel_rank()
+                    if get_moe_expert_parallel_world_size() > 1
+                    else get_moe_tensor_parallel_rank()
+                )
+            )
+            _mnnvl_dump_inputs(
+                call_id=call_id,
+                rank_id=rank_id,
+                input_tensor=input_tensor,
+                residual=residual,
+                weight=weight,
+                eps=eps,
+                use_oneshot=use_oneshot,
+                fp32_acc=fp32_acc,
+                use_attn_tp_group=use_attn_tp_group,
+            )
 
     _flashinfer_comm.allreduce_fusion(
         input=input_tensor,

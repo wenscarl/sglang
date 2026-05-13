@@ -374,6 +374,15 @@ class Envs:
     # transport issue on GB200/GB300 platforms is fixed and verified resolved.
     SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT = EnvBool(None)
 
+    # MNNVL hang-dump: when SGLANG_MNNVL_HANG_DUMP=1, every 4th (non-capturing)
+    # call to flashinfer_allreduce_residual_rmsnorm snapshots its inputs to
+    # SGLANG_MNNVL_HANG_DUMP_DIR for offline analysis with
+    # analyze_mnnvl_dump.py (stride matches hang_root_cause.md's eager-dump
+    # preset). A hang leaves the most-recent dump on disk, which is enough to
+    # spot FTZ subnormal victims in the polling-sentinel path.
+    SGLANG_MNNVL_HANG_DUMP = EnvBool(False)
+    SGLANG_MNNVL_HANG_DUMP_DIR = EnvStr("/tmp/mnnvl_hang_dump")
+
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
