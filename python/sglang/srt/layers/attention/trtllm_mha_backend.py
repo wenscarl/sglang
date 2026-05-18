@@ -30,6 +30,146 @@ logger = logging.getLogger(__name__)
 if is_flashinfer_available():
     import flashinfer
 
+    # The trtllm-gen attention kernels are launched on K/V cache tensors that
+    # come from `pool.get_kv_buffer(...).view(...).permute(0, 2, 1, 3)`, which
+    # produces a non-contiguous view. Under `--enable-torch-compile`, inductor
+    # would otherwise insert a `clone()` to realize the view into a contiguous
+    # tensor before calling the opaque flashinfer C++ extension (the flashinfer
+    # `register_custom_op` is a no-op shim — see flashinfer/utils.py — so it
+    # does not declare any stride flexibility itself). That clone copies the
+    # entire K/V pool every layer and dominates GPU time.
+    #
+    # Wrapping the calls in our own custom ops tagged with `flexible_layout`
+    # tells inductor it may pass arbitrary-strided inputs through, so the
+    # permuted view stays free. The flashinfer trtllm-gen kernel only requires
+    # `head_dim` stride == 1, which `.permute(0, 2, 1, 3)` preserves.
+    @torch.library.custom_op(
+        "sglang::trtllm_mha_batch_decode",
+        mutates_args=("workspace_buffer",),
+        device_types="cuda",
+        tags=[torch.Tag.flexible_layout],
+    )
+    def _trtllm_mha_batch_decode(
+        query: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        bmm1_scale: float,
+        bmm2_scale: float,
+        window_left: int,
+        sinks: Optional[torch.Tensor],
+        skip_softmax_threshold_scale_factor: Optional[float],
+        out_dtype: torch.dtype,
+        q_len_per_req: Optional[int],
+    ) -> torch.Tensor:
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=query,
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            window_left=window_left,
+            sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            out_dtype=out_dtype,
+            q_len_per_req=q_len_per_req,
+        )
+
+    @_trtllm_mha_batch_decode.register_fake
+    def _(
+        query,
+        k_cache,
+        v_cache,
+        workspace_buffer,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        bmm1_scale,
+        bmm2_scale,
+        window_left,
+        sinks,
+        skip_softmax_threshold_scale_factor,
+        out_dtype,
+        q_len_per_req,
+    ):
+        return query.new_empty(
+            (query.shape[0], query.shape[1], v_cache.shape[-1]), dtype=out_dtype
+        )
+
+    @torch.library.custom_op(
+        "sglang::trtllm_mha_batch_context",
+        mutates_args=("workspace_buffer",),
+        device_types="cuda",
+        tags=[torch.Tag.flexible_layout],
+    )
+    def _trtllm_mha_batch_context(
+        query: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_q_len: int,
+        max_kv_len: int,
+        bmm1_scale: float,
+        bmm2_scale: float,
+        batch_size: int,
+        cum_seq_lens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
+        window_left: int,
+        sinks: Optional[torch.Tensor],
+        skip_softmax_threshold_scale_factor: Optional[float],
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            query=query,
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            batch_size=batch_size,
+            cum_seq_lens_q=cum_seq_lens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+            window_left=window_left,
+            sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            out_dtype=out_dtype,
+        )
+
+    @_trtllm_mha_batch_context.register_fake
+    def _(
+        query,
+        k_cache,
+        v_cache,
+        workspace_buffer,
+        block_tables,
+        seq_lens,
+        max_q_len,
+        max_kv_len,
+        bmm1_scale,
+        bmm2_scale,
+        batch_size,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+        window_left,
+        sinks,
+        skip_softmax_threshold_scale_factor,
+        out_dtype,
+    ):
+        return query.new_empty(
+            (query.shape[0], query.shape[1], v_cache.shape[-1]), dtype=out_dtype
+        )
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -696,6 +836,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         self.forward_metadata = metadata
 
+    # Run attention outside the torch.compile region. The pool's in-place
+    # `set_kv_buffer` followed by `get_kv_buffer().view().permute()` reads back
+    # the same storage; AOTAutograd functionalization sees the mutate-then-read
+    # pair and forces inductor to materialize the whole permuted KV cache every
+    # layer (the `triton_poi_fused_as_strided_clone/copy__view_*` kernels).
+    # `flexible_layout` on the flashinfer wrapper op only controls input layout
+    # at the custom-op boundary; it does not undo the functionalization rewrite.
+    # The triton backend dodges this by reading via `k_buffer[cache_loc]` (no
+    # permute) and wrapping its kernel call with `torch.compiler.disable`; we
+    # need the same here because the `.view().permute()` itself must stay out
+    # of the compiled region.
+    @torch.compiler.disable
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -748,8 +900,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if layer.tp_v_head_num == 1:
             v_cache = canonicalize_stride(v_cache)
 
-        kv_cache = (k_cache, v_cache)
-
         # TODO: add support for quantization
         q_scale = 1.0
         k_scale = (
@@ -764,11 +914,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
-        # Call TRT-LLM kernel
+        # Call TRT-LLM kernel via the flexible_layout-tagged wrapper so that
+        # inductor does not realize the permuted K/V cache view into a clone.
         # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
-        o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        o = torch.ops.sglang.trtllm_mha_batch_decode(
             query=q,
-            kv_cache=kv_cache,
+            k_cache=k_cache,
+            v_cache=v_cache,
             workspace_buffer=self.workspace_buffer,
             block_tables=page_table,
             seq_lens=self.forward_metadata.cache_seqlens_int32,
@@ -779,10 +931,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             sinks=attention_sink,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             out_dtype=self.q_data_type,  # model_runner.dtype
+            q_len_per_req=1,  # flashinfer's default; decode is one token per request
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    # See the explanation above `forward_decode`. Same mutate-then-read pattern,
+    # same reason it must stay out of the compiled region.
+    @torch.compiler.disable
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -852,9 +1008,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            o = torch.ops.sglang.trtllm_mha_batch_decode(
                 query=q,
-                kv_cache=kv_cache,
+                k_cache=k_cache,
+                v_cache=v_cache,
                 workspace_buffer=self.workspace_buffer,
                 block_tables=page_table,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
@@ -868,9 +1025,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
             )
         else:
-            o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            o = torch.ops.sglang.trtllm_mha_batch_context(
                 query=q,
-                kv_cache=kv_cache,
+                k_cache=k_cache,
+                v_cache=v_cache,
                 workspace_buffer=self.workspace_buffer,
                 block_tables=page_table,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
