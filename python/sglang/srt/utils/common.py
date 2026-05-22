@@ -45,6 +45,7 @@ import traceback
 import types
 import uuid
 import warnings
+from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -99,6 +100,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
+
+
+def flatten_arrays_to_int64_tensor(
+    parts: List[array[int]], device, pin: bool
+) -> torch.Tensor:
+    """Flatten a list of array.array('q') buffers into one int64 tensor.
+
+    Uses NumPy here to speed up the conversion by using memcpy
+    instead of a per-element PyLong-to-int64 walk.
+    """
+    combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
+    cpu_t = torch.from_numpy(combined)
+    if pin:
+        cpu_t = cpu_t.pin_memory()
+    return cpu_t.to(device, non_blocking=True)
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -314,6 +330,18 @@ def is_flashinfer_available():
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
+
+
+@lru_cache(maxsize=1)
+def is_tokenspeed_mla_available():
+    """
+    Check whether the tokenspeed_mla CuTe DSL kernels are available.
+    Only available on NVIDIA Blackwell (SM100) at the moment.
+    """
+    return (
+        importlib.util.find_spec("tokenspeed_mla") is not None
+        and is_blackwell_supported()
+    )
 
 
 def is_nvidia_cublas_version_ge_12_9():
@@ -770,17 +798,24 @@ def load_audio(
     if _BACKEND == "torchcodec":
         from torchcodec.decoders import AudioDecoder
 
-        decoder = AudioDecoder(
-            source,
-            sample_rate=sr,
-            num_channels=1 if mono else None,
-        )
-        samples = decoder.get_all_samples()
-        if mono:
-            return samples.data.squeeze(0).numpy()
-        return samples.data.T.numpy()
+        try:
+            decoder = AudioDecoder(
+                source,
+                sample_rate=sr,
+                num_channels=1 if mono else None,
+            )
+            samples = decoder.get_all_samples()
+            if mono:
+                return samples.data.squeeze(0).numpy()
+            return samples.data.T.numpy()
+        except Exception as e:
+            # torchcodec's bytes-buffer IO can fail on WAV files that carry
+            # large trailing metadata chunks. Fall back to soundfile, which reads the PCM payload directly.
+            logger.warning(
+                f"torchcodec AudioDecoder failed ({e}); falling back to soundfile + torchaudio."
+            )
 
-    # Fallback: soundfile + torchaudio (ARM / no FFmpeg)
+    # Fallback: soundfile + torchaudio (ARM / no FFmpeg / torchcodec failure)
     import soundfile as sf
     import torch
     import torchaudio
@@ -3538,6 +3573,10 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "k_proj",
     "v_proj",
     "o_proj",
+    "q_a_proj",
+    "kv_a_proj_with_mqa",
+    "q_b_proj",
+    "kv_b_proj",
     "gate_proj",
     "up_proj",
     "down_proj",
@@ -3638,7 +3677,15 @@ class ConcurrentCounter:
 
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
-    return importlib.util.find_spec("triton_kernels") is not None
+    if importlib.util.find_spec("triton_kernels") is None:
+        return False
+    try:
+        ragged_metadata_spec = importlib.util.find_spec(
+            "triton_kernels.tensor_details.ragged_tensor"
+        )
+    except ModuleNotFoundError:
+        return False
+    return ragged_metadata_spec is not None
 
 
 @lru_cache(maxsize=1)
