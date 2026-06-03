@@ -89,8 +89,10 @@ class RadixAttention(nn.Module):
         self.use_irope = use_irope
         self.k_scale = None
         self.v_scale = None
+        self.q_scale = None
         self.k_scale_float = None
         self.v_scale_float = None
+        self.q_scale_float = None
         self.quant_method = None
 
         if quant_config is not None:

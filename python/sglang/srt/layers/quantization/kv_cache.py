@@ -42,8 +42,15 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.v_scale = torch.nn.Parameter(
             torch.tensor(-1.0, dtype=torch.float32), requires_grad=False
         )
+        # q_scale is only present in checkpoints that also quantize the query
+        # for FP8 attention (e.g. ModelOpt's q_proj.q_scale). It is consumed by
+        # backends that run the QK^T matmul in FP8 (see trtllm_mha).
+        layer.q_scale = torch.nn.Parameter(
+            torch.tensor(-1.0, dtype=torch.float32), requires_grad=False
+        )
         layer.k_scale._skip_weight_check = True
         layer.v_scale._skip_weight_check = True
+        layer.q_scale._skip_weight_check = True
 
     def apply(self, layer: torch.nn.Module) -> torch.Tensor:
         raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")
@@ -83,3 +90,19 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.v_scale.copy_(v_scale)
         layer.k_scale_float = k_scale
         layer.v_scale_float = v_scale
+
+        # Query scale for FP8 attention. Independent of k/v: a checkpoint may
+        # ship k_scale/v_scale (FP8 KV cache) without q_scale. Default to 1.0
+        # (no query quantization) when it is absent.
+        q_scale = getattr(layer, "q_scale", None)
+        if q_scale is not None and q_scale > 0.0:
+            q_scale = q_scale.to("cpu").tolist()
+            if is_fp8_fnuz():
+                q_scale *= 2
+        else:
+            q_scale = 1.0
+        if not isinstance(q_scale, float):
+            raise ValueError("Only support per-tensor scaling factor for fp8 attention")
+        if getattr(layer, "q_scale", None) is not None:
+            layer.q_scale.copy_(q_scale)
+        layer.q_scale_float = q_scale

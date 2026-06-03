@@ -1512,8 +1512,8 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
             return None
         return remapped_name
 
-    possible_scale_names = [".k_scale", ".v_scale"]
-    # Patterns where modelopt stores scales under k_proj/v_proj
+    possible_scale_names = [".q_scale", ".k_scale", ".v_scale"]
+    # Patterns where modelopt stores scales under q_proj/k_proj/v_proj
     # but the model expects them under attn (RadixAttention)
     modelopt_attn_prefixes = [".self_attn.", ".mixer."]
     for scale_name in possible_scale_names:

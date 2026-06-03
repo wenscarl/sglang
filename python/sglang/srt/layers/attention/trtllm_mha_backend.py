@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
@@ -738,9 +739,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
+        # Dynamically quantize the query to FP8 with a per-tensor scale computed
+        # from this batch's queries (q_fp8 * q_scale ~= q). The scale is folded
+        # into bmm1_scale below and passed to the kernel as a float32 device
+        # tensor, so there is no device->host sync and the path stays CUDA-graph
+        # safe. The XQA path keeps q in bf16, so q_scale stays 1.0 there.
+        q_scale = 1.0
         # For XQA, q_dtype should be bf16
         if self.data_type == torch.float8_e4m3fn and (not self.is_xqa_impl):
-            q = q.to(torch.float8_e4m3fn)
+            # scaled_fp8_quant requires a 2D input; flatten the head dims.
+            q, q_scale = scaled_fp8_quant(
+                q.reshape(-1, layer.tp_q_head_num * layer.head_dim), scale=None
+            )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # shape conversion:
@@ -759,8 +769,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         kv_cache = (k_cache, v_cache)
 
-        # TODO: add support for quantization
-        q_scale = 1.0
         k_scale = (
             layer.k_scale_float
             if getattr(layer, "k_scale_float", None) is not None
@@ -824,8 +832,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
+        # Dynamically quantize the query to FP8 with a per-tensor scale computed
+        # from this batch's queries (q_fp8 * q_scale ~= q). The scale is folded
+        # into bmm1_scale below and passed to the kernels as a float32 device
+        # tensor (no device->host sync; CUDA-graph safe). q_scale stays 1.0 when
+        # the query is not quantized.
+        q_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
-            q = q.to(torch.float8_e4m3fn)
+            # scaled_fp8_quant requires a 2D input; flatten the head dims.
+            q, q_scale = scaled_fp8_quant(
+                q.reshape(-1, layer.tp_q_head_num * layer.head_dim), scale=None
+            )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -845,8 +862,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-        # TODO: add support for quantization
-        q_scale = 1.0
         k_scale = (
             layer.k_scale_float
             if getattr(layer, "k_scale_float", None) is not None
