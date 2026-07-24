@@ -3,7 +3,12 @@
 // Fixup kernel for TRT-LLM ragged attention zero-KV rows.
 // For sequences with kv_len == 0, forces out=0 and lse=-inf.
 // 2D grid: (blocks_per_seq, batch_size). Y-dim early-exits for non-zero KV.
-// Uses vectorised float4 stores for bandwidth efficiency.
+//
+// Two kernel variants are compiled; the host launcher selects at dispatch time:
+//   _vec    -- float4 stores (16-byte aligned row bases, maximum bandwidth)
+//   _scalar -- element-wise stores (any alignment, e.g. TP configs where
+//              lse row stride = nh*4 bytes is not a 16-byte multiple)
+// The alignment check is done once on the host; no branch lives in the kernel.
 
 #include <sgl_kernel/tensor.h>
 
@@ -15,46 +20,52 @@ namespace {
 
 constexpr int kFixupBlockSize = 256;
 
-// -- vectorised zero-fill helpers ------------------------------------------
+// -- fill helpers: vectorised (16-byte aligned rows) -----------------------
 
-// Zero-fill `n` elements of type T starting at `ptr`, using float4 stores.
-// `ptr` must be 16-byte aligned (guaranteed by PyTorch allocator).
 template <typename T>
 __device__ __forceinline__ void vec_zero_fill(T* ptr, int n) {
-  constexpr int kVec = 16 / sizeof(T);  // elements per float4
-  const int n_vec = n / kVec;           // full vectors
+  constexpr int kVec = 16 / sizeof(T);
+  const int n_vec = n / kVec;
   float4* dst4 = reinterpret_cast<float4*>(ptr);
   const float4 z4 = make_float4(0.f, 0.f, 0.f, 0.f);
-  for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
+  for (int i = threadIdx.x; i < n_vec; i += blockDim.x)
     dst4[i] = z4;
-  }
-  // tail elements
   const int tail_start = n_vec * kVec;
-  for (int i = tail_start + threadIdx.x; i < n; i += blockDim.x) {
+  for (int i = tail_start + threadIdx.x; i < n; i += blockDim.x)
     ptr[i] = static_cast<T>(0);
-  }
 }
 
-// Fill `n` float elements with -inf using float4 stores.
 __device__ __forceinline__ void vec_neginf_fill(float* ptr, int n) {
-  constexpr int kVec = 4;  // float4 = 4 floats
+  constexpr int kVec = 4;
   const int n_vec = n / kVec;
   float4* dst4 = reinterpret_cast<float4*>(ptr);
   const float ninf = -INFINITY;
   const float4 inf4 = make_float4(ninf, ninf, ninf, ninf);
-  for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
+  for (int i = threadIdx.x; i < n_vec; i += blockDim.x)
     dst4[i] = inf4;
-  }
   const int tail_start = n_vec * kVec;
-  for (int i = tail_start + threadIdx.x; i < n; i += blockDim.x) {
+  for (int i = tail_start + threadIdx.x; i < n; i += blockDim.x)
     ptr[i] = ninf;
-  }
 }
 
-// -- main kernel -----------------------------------------------------------
+// -- fill helpers: scalar (arbitrary alignment) ----------------------------
+
+template <typename T>
+__device__ __forceinline__ void scalar_zero_fill(T* ptr, int n) {
+  for (int i = threadIdx.x; i < n; i += blockDim.x)
+    ptr[i] = static_cast<T>(0);
+}
+
+__device__ __forceinline__ void scalar_neginf_fill(float* ptr, int n) {
+  const float ninf = -INFINITY;
+  for (int i = threadIdx.x; i < n; i += blockDim.x)
+    ptr[i] = ninf;
+}
+
+// -- kernels ---------------------------------------------------------------
 
 template <typename OutT>
-__global__ void fixup_zero_kv_rows_kernel(
+__global__ void fixup_zero_kv_rows_kernel_vec(
     OutT* __restrict__ out,
     float* __restrict__ lse,
     const int32_t* __restrict__ kv_lens,
@@ -63,19 +74,32 @@ __global__ void fixup_zero_kv_rows_kernel(
     const int lse_stride) {
   const int seq_idx = blockIdx.y;
   if (kv_lens[seq_idx] > 0) return;
-
   const int tok_start = cum_seq_lens[seq_idx];
   const int tok_end = cum_seq_lens[seq_idx + 1];
-  const int num_tokens = tok_end - tok_start;
-  if (num_tokens <= 0) return;
-
-  // blockIdx.x selects a token within this sequence.
+  if (tok_start >= tok_end) return;
   const int tok = tok_start + blockIdx.x;
   if (tok >= tok_end) return;
-
-  // Each block handles one token: zero out[tok] and set lse[tok] = -inf.
   vec_zero_fill(out + tok * out_stride, out_stride);
   vec_neginf_fill(lse + tok * lse_stride, lse_stride);
+}
+
+template <typename OutT>
+__global__ void fixup_zero_kv_rows_kernel_scalar(
+    OutT* __restrict__ out,
+    float* __restrict__ lse,
+    const int32_t* __restrict__ kv_lens,
+    const int32_t* __restrict__ cum_seq_lens,
+    const int out_stride,
+    const int lse_stride) {
+  const int seq_idx = blockIdx.y;
+  if (kv_lens[seq_idx] > 0) return;
+  const int tok_start = cum_seq_lens[seq_idx];
+  const int tok_end = cum_seq_lens[seq_idx + 1];
+  if (tok_start >= tok_end) return;
+  const int tok = tok_start + blockIdx.x;
+  if (tok >= tok_end) return;
+  scalar_zero_fill(out + tok * out_stride, out_stride);
+  scalar_neginf_fill(lse + tok * lse_stride, lse_stride);
 }
 
 // -- host launcher ---------------------------------------------------------
@@ -106,19 +130,35 @@ void fixup_zero_kv_rows(
   const int nh = static_cast<int>(num_heads.unwrap());
   const int vd = static_cast<int>(v_head_dim.unwrap());
 
-  // Grid: one block per (token, sequence). X = max tokens in any seq.
   const int blocks_x = static_cast<int>(max_seq_len);
   dim3 grid(blocks_x, bs);
   dim3 block(kFixupBlockSize);
 
-  LaunchKernel(grid, block, device.unwrap())(
-      fixup_zero_kv_rows_kernel<OutT>,
-      static_cast<OutT*>(out.data_ptr()),
-      static_cast<float*>(lse.data_ptr()),
-      static_cast<const int32_t*>(kv_lens.data_ptr()),
-      static_cast<const int32_t*>(cum_seq_lens.data_ptr()),
-      nh * vd,
-      nh);
+  // Check whether every row base is 16-byte aligned. The PyTorch allocator
+  // guarantees the tensor base pointer is >=256-byte aligned, so row k starts
+  // at base + k*stride_bytes. All rows are aligned iff stride_bytes % 16 == 0.
+  const bool lse_aligned = (nh * sizeof(float)) % 16 == 0;
+  const bool out_aligned = (nh * vd * sizeof(OutT)) % 16 == 0;
+
+  if (lse_aligned && out_aligned) {
+    LaunchKernel(grid, block, device.unwrap())(
+        fixup_zero_kv_rows_kernel_vec<OutT>,
+        static_cast<OutT*>(out.data_ptr()),
+        static_cast<float*>(lse.data_ptr()),
+        static_cast<const int32_t*>(kv_lens.data_ptr()),
+        static_cast<const int32_t*>(cum_seq_lens.data_ptr()),
+        nh * vd,
+        nh);
+  } else {
+    LaunchKernel(grid, block, device.unwrap())(
+        fixup_zero_kv_rows_kernel_scalar<OutT>,
+        static_cast<OutT*>(out.data_ptr()),
+        static_cast<float*>(lse.data_ptr()),
+        static_cast<const int32_t*>(kv_lens.data_ptr()),
+        static_cast<const int32_t*>(cum_seq_lens.data_ptr()),
+        nh * vd,
+        nh);
+  }
 }
 
 }  // namespace
