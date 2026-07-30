@@ -479,11 +479,13 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     downstream component will fuse, replace, or absorb it.
 
     Skip reasons, in order:
-      - ``get_forward().fuse_mlp_allreduce``: LayerCommunicator will fuse the
-        all-reduce with the next layer's residual all-reduce.
       - ``get_forward().mlp_reduce_scatter``: LayerCommunicator's post-attention
         scatter will do reduce-scatter, which would double-reduce on top of
         an all-reduce.
+      - ``get_forward().fuse_mlp_allreduce``: LayerCommunicator will fuse the
+        all-reduce with the next layer's residual all-reduce. That fused kernel
+        reduces over one group, so under hybrid EP+TP it absorbs only the
+        MoE-TP reduction and the EP one still runs here.
       - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
         path replaces the all-reduce with a reduce-scatterv.
       - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
@@ -500,8 +502,20 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     the decoder via ``get_forward().scoped(...)``. Pass ``is_tp_path=True``
     for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
     """
-    if should_skip_mlp_all_reduce():
+    f = get_forward()
+    if f.mlp_reduce_scatter:
+        # Reduce-scatter replaces the reduction outright; both paths must skip.
         return True
+    if f.fuse_mlp_allreduce:
+        # The next layer's fused residual+LN reduces over a single group, so it
+        # can absorb only one of the two post-experts reductions. Under hybrid
+        # EP+TP the absorbed one is the MoE-TP reduction -- that is the group
+        # the fusion workspace rendezvouses on (see resolve_fusion_group) -- so
+        # the EP reduction still has to run inline here. Skipping both would
+        # reduce over half the peers and silently corrupt the activations.
+        from sglang.srt.layers.flashinfer_comm_fusion import is_hybrid_moe_ep_tp
+
+        return is_tp_path if is_hybrid_moe_ep_tp() else True
     if get_server_args().dwdp_size > 1:
         return True
     if should_use_dp_reduce_scatterv():

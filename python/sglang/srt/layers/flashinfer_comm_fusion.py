@@ -632,6 +632,59 @@ def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManage
     return manager
 
 
+def is_hybrid_moe_ep_tp() -> bool:
+    """Whether the MoE emits two post-experts reductions rather than one.
+
+    With both ``moe_ep_size > 1`` and ``moe_tp_size > 1`` the MoE runs
+    ``moe_expert_parallel_all_reduce`` and then
+    ``moe_tensor_model_parallel_all_reduce`` over two disjoint groups. Only the
+    last one can be absorbed by the next layer's fused residual+LN, which
+    reduces over a single group.
+
+    ``moe_dp_size`` deliberately does not appear here: it changes how many peers
+    the two reductions cover in total, but not the fact that there are two of
+    them, and the deferred one is still the MoE-TP one on the MoE-TP group.
+    """
+    parallel = get_parallel()
+    return parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1
+
+
+def _fusion_uses_moe_tp_group() -> bool:
+    """Which group the MoE fusion workspace rendezvouses on.
+
+    Single source of truth for the rule -- the workspace, the fused kernel's
+    world size, and (in the allreduce-only path) the group tagging all derive
+    from it. They used to spell it out separately, and a disagreement makes the
+    kernel reduce across the wrong peers with no error.
+
+    The MoE workspace serves whichever post-experts reduction gets absorbed by
+    the next layer's fused residual+LN. That is the MoE-TP one whenever a MoE-TP
+    reduction exists -- including under hybrid EP+TP, where the EP reduction
+    stays inline and only the (last) TP one is deferred. When ``moe_tp_size ==
+    1`` there is no TP reduction and the EP one is deferred instead.
+    """
+    return get_parallel().moe_tp_size > 1
+
+
+def resolve_fusion_world_size(*, use_attn_tp_group: bool) -> int:
+    """Peer count of the fusion group. Reads sizes only -- deliberately does not
+    touch the group coordinators, which callers may reach before those exist."""
+    parallel = get_parallel()
+    if use_attn_tp_group:
+        return parallel.attn_tp_size
+    return parallel.moe_tp_size if _fusion_uses_moe_tp_group() else parallel.moe_ep_size
+
+
+def resolve_fusion_group(*, use_attn_tp_group: bool):
+    """The (world_size, rank, coordinator) the fusion workspace rendezvouses on."""
+    parallel = get_parallel()
+    if use_attn_tp_group:
+        return parallel.attn_tp_size, parallel.attn_tp_rank, get_attn_tp_group()
+    if _fusion_uses_moe_tp_group():
+        return parallel.moe_tp_size, parallel.moe_tp_rank, get_moe_tp_group()
+    return parallel.moe_ep_size, parallel.moe_ep_rank, get_moe_ep_group()
+
+
 def _sync_allreduce_unavailable_across_tp():
     """Synchronize _flashinfer_allreduce_unavailable across all TP ranks.
 
@@ -679,19 +732,9 @@ def ensure_workspace_initialized(
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
 
-    if use_attn_tp_group:
-        world_size = get_parallel().attn_tp_size
-        rank = get_parallel().attn_tp_rank
-        coordinator = get_attn_tp_group()
-    else:
-        if get_parallel().moe_ep_size > 1:
-            world_size = get_parallel().moe_ep_size
-            rank = get_parallel().moe_ep_rank
-            coordinator = get_moe_ep_group()
-        else:
-            world_size = get_parallel().moe_tp_size
-            rank = get_parallel().moe_tp_rank
-            coordinator = get_moe_tp_group()
+    world_size, rank, coordinator = resolve_fusion_group(
+        use_attn_tp_group=use_attn_tp_group
+    )
 
     # Always pass the coordinator's groups: flashinfer >=0.6.10 reads the
     # rendezvous group from `group=...` (falling back to WORLD when None),
@@ -799,13 +842,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         )
         return None, None
 
-    if use_attn_tp_group:
-        world_size = get_parallel().attn_tp_size
-    else:
-        if get_parallel().moe_ep_size > 1:
-            world_size = get_parallel().moe_ep_size
-        else:
-            world_size = get_parallel().moe_tp_size
+    world_size = resolve_fusion_world_size(use_attn_tp_group=use_attn_tp_group)
 
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")
