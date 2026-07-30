@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -29,6 +30,7 @@ class _FakeFlashInferComm:
 
     def __init__(self):
         self.calls = []
+        self.allreduce_calls = []
 
     def create_allreduce_fusion_workspace(self, **kwargs):
         self.calls.append(kwargs)
@@ -47,6 +49,7 @@ class _FakeFlashInferComm:
         rms_eps=None,
         **_kwargs,
     ):
+        self.allreduce_calls.append(pattern)
         if pattern is self.AllReduceFusionPattern.kAllReduce:
             return input * workspace.world_size
 
@@ -249,12 +252,13 @@ class TestFlashInferCommFusion(unittest.TestCase):
 
 
 class TestFlashInferAllReduceOnly(unittest.TestCase):
-    def _make_manager(self, world_size):
+    def _make_manager(self, world_size, group):
         manager = fusion.FlashInferWorkspaceManager()
         manager.workspace = _FakeWorkspace(None, world_size)
         manager.initialized = True
         manager.max_token_num = 2048
         manager.hidden_dim = 4096
+        manager.group = group
         return manager
 
     def _set_attn_workspace_manager(self, manager):
@@ -275,7 +279,15 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
     def test_allreduce_output_equals_input_times_world_size(self):
         world_size = 4
         fake_comm = _FakeFlashInferComm()
-        manager = self._make_manager(world_size)
+        # The guard must compare the group handles element-wise, not the
+        # identity of the tuple that carries them: the caller rebuilds
+        # ``(device_group, cpu_group)`` on every all-reduce, so an identity
+        # check would reject every legitimate dispatch.
+        device_group, cpu_group = object(), object()
+        manager_group = (device_group, cpu_group)
+        expected_group = (device_group, cpu_group)
+        self.assertIsNot(manager_group, expected_group)
+        manager = self._make_manager(world_size, group=manager_group)
 
         original_comm = fusion._flashinfer_comm
         original_unavailable = fusion._flashinfer_allreduce_unavailable
@@ -293,10 +305,51 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
             expected = input_ * world_size
 
             with get_parallel().override(attn_tp_size=world_size):
-                result = fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
+                result = fusion.flashinfer_allreduce(
+                    input_, use_attn_tp_group=True, expected_group=expected_group
+                )
 
             self.assertIsNotNone(result)
+            self.assertEqual(
+                fake_comm.allreduce_calls,
+                [fake_comm.AllReduceFusionPattern.kAllReduce],
+            )
             torch.testing.assert_close(result, expected)
+        finally:
+            fusion._flashinfer_comm = original_comm
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+            self._restore_attn_workspace_manager(buffers, manager_key, original_manager)
+
+    def test_group_mismatch_returns_none_before_dispatch(self):
+        """A workspace rendezvoused with different peers must not be reused.
+
+        Equally sized TP/EP groups can hold different peers, so a world-size
+        match is not sufficient: the exact (device_group, cpu_group) tuple has
+        to match or the kernel would address the wrong ranks.
+        """
+        world_size = 4
+        fake_comm = _FakeFlashInferComm()
+        manager_group = (object(), object())
+        expected_group = (object(), object())
+        manager = self._make_manager(world_size, group=manager_group)
+
+        original_comm = fusion._flashinfer_comm
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
+            manager
+        )
+        try:
+            fusion._flashinfer_comm = fake_comm
+            fusion._flashinfer_allreduce_unavailable = False
+
+            input_ = torch.randn(8, 16)
+            with get_parallel().override(attn_tp_size=world_size):
+                result = fusion.flashinfer_allreduce(
+                    input_, use_attn_tp_group=True, expected_group=expected_group
+                )
+
+            self.assertIsNone(result)
+            self.assertEqual(fake_comm.allreduce_calls, [])
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._flashinfer_allreduce_unavailable = original_unavailable
@@ -305,7 +358,8 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
     def test_shape_guard_returns_none_for_non_2d(self):
         world_size = 4
         fake_comm = _FakeFlashInferComm()
-        manager = self._make_manager(world_size)
+        group_key = (object(), object())
+        manager = self._make_manager(world_size, group=group_key)
 
         original_comm = fusion._flashinfer_comm
         original_unavailable = fusion._flashinfer_allreduce_unavailable
@@ -320,10 +374,14 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
             input_3d = torch.randn(2, 8, 16)
 
             self.assertIsNone(
-                fusion.flashinfer_allreduce(input_1d, use_attn_tp_group=True)
+                fusion.flashinfer_allreduce(
+                    input_1d, use_attn_tp_group=True, expected_group=group_key
+                )
             )
             self.assertIsNone(
-                fusion.flashinfer_allreduce(input_3d, use_attn_tp_group=True)
+                fusion.flashinfer_allreduce(
+                    input_3d, use_attn_tp_group=True, expected_group=group_key
+                )
             )
         finally:
             fusion._flashinfer_comm = original_comm
@@ -333,7 +391,8 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
     def test_shape_guard_returns_none_for_non_contiguous(self):
         world_size = 4
         fake_comm = _FakeFlashInferComm()
-        manager = self._make_manager(world_size)
+        group_key = (object(), object())
+        manager = self._make_manager(world_size, group=group_key)
 
         original_comm = fusion._flashinfer_comm
         original_unavailable = fusion._flashinfer_allreduce_unavailable
@@ -349,7 +408,9 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
             self.assertFalse(non_contiguous.is_contiguous())
 
             self.assertIsNone(
-                fusion.flashinfer_allreduce(non_contiguous, use_attn_tp_group=True)
+                fusion.flashinfer_allreduce(
+                    non_contiguous, use_attn_tp_group=True, expected_group=group_key
+                )
             )
         finally:
             fusion._flashinfer_comm = original_comm
@@ -362,10 +423,50 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
             fusion._flashinfer_allreduce_unavailable = True
             input_ = torch.randn(8, 16)
             self.assertIsNone(
-                fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
+                fusion.flashinfer_allreduce(
+                    input_,
+                    use_attn_tp_group=True,
+                    expected_group=(object(), object()),
+                )
             )
         finally:
             fusion._flashinfer_allreduce_unavailable = original_unavailable
+
+    def test_group_coordinator_hook_forwards_hint_and_own_groups(self):
+        """The GroupCoordinator hook must hand the guard its own groups.
+
+        ``flashinfer_allreduce`` can only reject a workspace rendezvoused with
+        other peers when it receives this group's exact ``(device_group,
+        cpu_group)`` tuple, so a hook that drops or reorders those arguments
+        would silently reuse a foreign workspace.
+        """
+        group = object.__new__(GroupCoordinator)
+        group._fi_workspace_hint = "attn_tp"
+        group.device_group = object()
+        group.cpu_group = object()
+        group.pynccl_comm = None
+
+        input_ = torch.randn(8, 16)
+        sentinel = torch.randn(8, 16)
+
+        with patch.object(
+            fusion, "flashinfer_allreduce", return_value=sentinel
+        ) as mock_allreduce:
+            result = group._try_flashinfer_allreduce(
+                input_, should_use_pymscclpp_allreduce=False
+            )
+
+        self.assertIs(result, sentinel)
+        self.assertEqual(mock_allreduce.call_count, 1)
+        args, kwargs = mock_allreduce.call_args
+        self.assertIs(args[0], input_)
+        self.assertEqual(
+            kwargs,
+            {
+                "use_attn_tp_group": True,
+                "expected_group": (group.device_group, group.cpu_group),
+            },
+        )
 
     def test_returns_none_when_workspace_uninitialized(self):
         world_size = 4
@@ -383,7 +484,11 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
 
             input_ = torch.randn(8, 16)
             with get_parallel().override(attn_tp_size=world_size):
-                result = fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
+                result = fusion.flashinfer_allreduce(
+                    input_,
+                    use_attn_tp_group=True,
+                    expected_group=(object(), object()),
+                )
             self.assertIsNone(result)
         finally:
             fusion._flashinfer_comm = original_comm

@@ -827,9 +827,17 @@ def flashinfer_allreduce_residual_rmsnorm(
 
 def flashinfer_allreduce(
     input_: torch.Tensor,
+    *,
     use_attn_tp_group: bool = True,
+    expected_group: Tuple[ProcessGroup, ProcessGroup],
 ) -> Optional[torch.Tensor]:
-    """Allreduce-only FlashInfer kAllReduce. Returns None to signal fallback to NCCL."""
+    """Allreduce-only FlashInfer kAllReduce. Returns None to signal fallback to NCCL.
+
+    ``expected_group`` is the caller's exact ``(device_group, cpu_group)`` pair
+    and is required: the workspace was rendezvoused with a fixed set of peers,
+    and equally sized TP/EP groups can contain different peers, so the tuple
+    must match element-wise rather than just the world size.
+    """
     if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
         return None
 
@@ -838,6 +846,9 @@ def flashinfer_allreduce(
 
     workspace_manager = _get_workspace_manager(use_attn_tp_group)
     if not workspace_manager.initialized or workspace_manager.workspace is None:
+        return None
+
+    if workspace_manager.group != expected_group:
         return None
 
     token_num, hidden_dim = input_.shape
