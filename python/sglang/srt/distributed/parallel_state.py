@@ -258,6 +258,9 @@ class GroupCoordinator:
     ca_comm: Optional[Any]  # Custom allreduce communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
+    # which flashinfer fusion workspace this group may all-reduce through,
+    # stamped by _tag_groups_for_flashinfer_allreduce_only (None = untagged)
+    _fi_workspace_hint: Optional[str]
 
     def __init__(
         self,
@@ -514,6 +517,9 @@ class GroupCoordinator:
                 self.cpu_group, 1 << 22, 6
             )
 
+        # Tagged later by _tag_groups_for_flashinfer_allreduce_only, if enabled.
+        self._fi_workspace_hint: Optional[str] = None
+
     def __repr__(self):
         return (
             f"ranks={self.ranks} rank={self.rank} local_rank={self.local_rank} use_pynccl={self.use_pynccl} "
@@ -618,6 +624,42 @@ class GroupCoordinator:
             with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
 
+    def _try_flashinfer_allreduce(
+        self,
+        input_: torch.Tensor,
+        should_use_pymscclpp_allreduce: bool,
+    ) -> Optional[torch.Tensor]:
+        """Attempt the FlashInfer all-reduce for groups tagged with a workspace hint.
+
+        Returns ``None`` when the group was not tagged by
+        ``_tag_groups_for_flashinfer_allreduce_only``, when the symmetric-memory
+        all-reduce is eligible (it keeps priority), when the input shape is
+        unsupported, when the fusion workspace was rendezvoused with a different
+        exact ``(device_group, cpu_group)`` pair, or when FlashInfer otherwise
+        declines the request.
+        """
+        fi_hint = self._fi_workspace_hint
+        if fi_hint is None:
+            return None
+
+        if (
+            self.pynccl_comm is not None
+            and self.is_symmetric_memory_enabled()
+            and not should_use_pymscclpp_allreduce
+        ):
+            return None
+
+        if input_.ndim != 2 or not input_.is_contiguous():
+            return None
+
+        from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allreduce
+
+        return flashinfer_allreduce(
+            input_,
+            use_attn_tp_group=(fi_hint == "attn_tp"),
+            expected_group=(self.device_group, self.cpu_group),
+        )
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -665,6 +707,12 @@ class GroupCoordinator:
             self.pymscclpp_comm is not None
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         )
+        fi_result = self._try_flashinfer_allreduce(
+            input_=input_,
+            should_use_pymscclpp_allreduce=should_use_pymscclpp_allreduce,
+        )
+        if fi_result is not None:
+            return fi_result
         if (
             self.pynccl_comm is not None
             and self.is_symmetric_memory_enabled()
@@ -674,16 +722,6 @@ class GroupCoordinator:
             with self.pynccl_comm.change_state(enable=True):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
-
-        fi_hint = getattr(self, "_fi_workspace_hint", None)
-        if fi_hint is not None and input_.ndim == 2 and input_.is_contiguous():
-            from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allreduce
-
-            result = flashinfer_allreduce(
-                input_, use_attn_tp_group=(fi_hint == "attn_tp")
-            )
-            if result is not None:
-                return result
 
         outplace_all_reduce_method = None
         if (
@@ -1926,7 +1964,6 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
-_ENABLE_FLASHINFER_ALLREDUCE_ONLY = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1944,16 +1981,9 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
-def set_flashinfer_allreduce_only(enable: bool):
-    global _ENABLE_FLASHINFER_ALLREDUCE_ONLY
-    _ENABLE_FLASHINFER_ALLREDUCE_ONLY = enable
-
-
 def _tag_groups_for_flashinfer_allreduce_only():
     """Stamp _fi_workspace_hint on each group coordinator so all_reduce() can dispatch
     to flashinfer_allreduce() without touching the call sites."""
-    if not _ENABLE_FLASHINFER_ALLREDUCE_ONLY:
-        return
     for group, hint in (
         (_TP, "attn_tp"),
         (_ATTN_TP, "attn_tp"),
