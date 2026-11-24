@@ -23,7 +23,10 @@ def _cos_sin_cache():
 @pytest.mark.parametrize("num_tokens", [1, 17, 700])
 @pytest.mark.parametrize("rope", [False, True])
 @pytest.mark.parametrize("cache_dtype", [None, torch.bfloat16, torch.float8_e4m3fn])
-def test_qk_norm_matches_native(num_tokens, rope, cache_dtype):
+@pytest.mark.parametrize("unified", [False, True])
+def test_qk_norm_matches_native(num_tokens, rope, cache_dtype, unified):
+    if unified and cache_dtype is None:
+        pytest.skip("no cache to lay out")
     torch.manual_seed(num_tokens)
     op = FusedQKNorm(
         head_dim=_HEAD_DIM, num_q_heads=_NUM_Q, num_kv_heads=_NUM_KV, eps=1e-6
@@ -40,9 +43,19 @@ def test_qk_norm_matches_native(num_tokens, rope, cache_dtype):
         if cache_dtype is None:
             return None
         torch.manual_seed(0)
-        shape = (_SLOTS, _NUM_KV * _HEAD_DIM)
-        k_cache = torch.randn(shape, device="cuda").to(cache_dtype)
-        v_cache = torch.randn(shape, device="cuda").to(cache_dtype)
+        row = _NUM_KV * _HEAD_DIM
+        if unified:
+            # The --enable-unified-memory layout: one entry per slot holding
+            # every layer's K and V rows, so each per-layer view is row-strided.
+            entry = torch.randn(_SLOTS, 3 * 2 * row + 128, device="cuda").to(
+                cache_dtype
+            )
+            k_cache, v_cache = entry[:, 2 * row : 3 * row], entry[:, 3 * row : 4 * row]
+            assert not k_cache.is_contiguous()
+        else:
+            shape = (_SLOTS, row)
+            k_cache = torch.randn(shape, device="cuda").to(cache_dtype)
+            v_cache = torch.randn(shape, device="cuda").to(cache_dtype)
         # Slot 0 is the CUDA-graph padding slot and is never written.
         cache_loc = torch.randperm(_SLOTS, device="cuda")[:num_tokens]
         return k_cache, v_cache, cache_loc
@@ -57,6 +70,12 @@ def test_qk_norm_matches_native(num_tokens, rope, cache_dtype):
     if cache_dtype is not None:
         for out, ref in zip(store[:2], ref_store[:2]):
             _assert_close(out, ref)
+        if unified:
+            # Bytes of other layers in the entry stay untouched.
+            base, ref_base = store[0]._base, ref_store[0]._base
+            torch.testing.assert_close(
+                base.float(), ref_base.float(), rtol=0.125, atol=0.125
+            )
 
 
 def _assert_close(out, ref):

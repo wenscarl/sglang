@@ -39,6 +39,8 @@ def _qk_rms_norm_fwd_kernel(
     CACHE_LOC,  # [T] pool row per token
     eps,
     stride_qkv,  # row stride of QKV, in elements
+    stride_kc,  # row stride of K_CACHE, in elements (the slot entry under unified memory)
+    stride_vc,  # row stride of V_CACHE, in elements
     n_rows,  # T * (NUM_Q_HEADS + NUM_KV_HEADS [+ NUM_KV_HEADS for V])
     kv_capacity,
     NUM_Q_HEADS: tl.constexpr,
@@ -112,12 +114,15 @@ def _qk_rms_norm_fwd_kernel(
         # Slot zero is reserved for CUDA-graph padding.
         kv_mask = mask & (loc != 0)[:, None]
         kv_head = tl.where(is_v, head - NUM_Q_HEADS - NUM_KV_HEADS, head - NUM_Q_HEADS)
-        kv_dst = loc * (NUM_KV_HEADS * D) + kv_head * D
+        # Rows may be strided: the unified memory pool hands out token-major
+        # views whose row stride is the whole slot entry, not NUM_KV_HEADS * D.
+        k_dst = loc * stride_kc + kv_head * D
+        v_dst = loc * stride_vc + kv_head * D
         tl.store(
-            K_CACHE + kv_dst[:, None] + cols[None, :], x, mask=kv_mask & is_k[:, None]
+            K_CACHE + k_dst[:, None] + cols[None, :], x, mask=kv_mask & is_k[:, None]
         )
         tl.store(
-            V_CACHE + kv_dst[:, None] + cols[None, :], x, mask=kv_mask & is_v[:, None]
+            V_CACHE + v_dst[:, None] + cols[None, :], x, mask=kv_mask & is_v[:, None]
         )
 
     q_dst = tl.where(is_q, (token * NUM_Q_HEADS + head) * D, 0)
@@ -292,6 +297,8 @@ class FusedQKNorm(BaseFusedOp):
             and kv_store[1].shape == kv_store[0].shape
             and kv_store[1].dtype == kv_store[0].dtype
             and kv_store[2].shape[0] >= tokens_of(qkv)
+            and _rows_dense(kv_store[0])
+            and _rows_dense(kv_store[1])
         ):
             return False
         return positions is None or (
@@ -340,7 +347,8 @@ class FusedQKNorm(BaseFusedOp):
             assert cos_sin_cache.is_contiguous() and positions.is_contiguous()
         if has_kv:
             k_cache, v_cache, cache_loc = kv_store
-            assert k_cache.is_contiguous() and v_cache.is_contiguous()
+            # Each row must be dense; rows themselves may be strided (unified pool).
+            assert _rows_dense(k_cache) and _rows_dense(v_cache)
             cache_loc = cache_loc.contiguous()
         _qk_rms_norm_fwd_kernel[(triton.cdiv(n_rows, block_m),)](
             qkv,
@@ -353,6 +361,8 @@ class FusedQKNorm(BaseFusedOp):
             cache_loc if has_kv else qkv,
             self._eps,
             qkv.stride(0),
+            k_cache.stride(0) if has_kv else 0,
+            v_cache.stride(0) if has_kv else 0,
             n_rows,
             k_cache.shape[0] if has_kv else 0,
             self._num_q_heads,
@@ -380,6 +390,11 @@ class FusedQKNorm(BaseFusedOp):
         return (
             helion_supported(qkv)
             and (kv_store is None or kv_store[0].dtype == qkv.dtype)
+            # Helion indexes a flat view of the cache: contiguous pools only.
+            and (
+                kv_store is None
+                or (kv_store[0].is_contiguous() and kv_store[1].is_contiguous())
+            )
             and qkv.shape[0] > 0
             and qkv.dtype == torch.bfloat16
             and qkv.dim() == 2
@@ -435,6 +450,16 @@ class FusedQKNorm(BaseFusedOp):
             num_tokens=qkv.shape[0],
             launch_pdl=is_arch_support_pdl(),
         )
+
+
+def _rows_dense(cache: torch.Tensor) -> bool:
+    """A 2-D cache whose rows are dense (stride 1); the row stride may exceed the
+    row width, as in the unified memory pool's token-major views."""
+    return (
+        cache.dim() == 2
+        and cache.stride(1) == 1
+        and cache.stride(0) >= cache.shape[1]
+    )
 
 
 def tokens_of(qkv: torch.Tensor) -> int:
